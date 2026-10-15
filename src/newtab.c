@@ -1,6 +1,7 @@
 #include "browser.h"
 #include <string.h>
 #include <math.h>
+#include <cairo.h>
 
 typedef struct {
     gdouble x, y;
@@ -32,25 +33,79 @@ static void init_stars(StarfieldData *sf, gint count) {
 }
 
 static gboolean on_starfield_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
-    (void)data;
     StarfieldData *sf = g_object_get_data(G_OBJECT(widget), "starfield");
     if (!sf || sf->destroyed) return FALSE;
+    ZhiBrowser *browser = data;
+    gboolean dark = TRUE;
+    if (browser && browser->theme)
+        dark = browser->theme->theme == ZHI_THEME_DARK;
     GtkAllocation alloc;
     gtk_widget_get_allocation(widget, &alloc);
     sf->width = alloc.width;
     sf->height = alloc.height;
-    cairo_set_source_rgba(cr, 0.08, 0.08, 0.14, 1.0);
-    cairo_paint(cr);
     gdouble time_val = g_get_monotonic_time() / 1000000.0;
+    if (dark) {
+        cairo_set_source_rgba(cr, 0.08, 0.08, 0.14, 1.0);
+        cairo_paint(cr);
+    } else {
+        cairo_pattern_t *grad = cairo_pattern_create_linear(0, 0, 0, alloc.height);
+        cairo_pattern_add_color_stop_rgba(grad, 0.0, 0.96, 0.97, 0.99, 1.0);
+        cairo_pattern_add_color_stop_rgba(grad, 1.0, 0.86, 0.89, 0.95, 1.0);
+        cairo_set_source(cr, grad);
+        cairo_paint(cr);
+        cairo_pattern_destroy(grad);
+        const struct {
+            gdouble bx, by, radius, r, g, b, a, speed, phase;
+        } blobs[] = {
+            {0.14, 0.18, 0.52, 0.29, 0.73, 0.95, 0.22, 0.045, 0.0},
+            {0.86, 0.12, 0.46, 0.66, 0.58, 0.90, 0.20, 0.038, 2.1},
+            {0.72, 0.88, 0.55, 0.42, 0.72, 0.92, 0.18, 0.032, 4.0},
+            {0.22, 0.82, 0.40, 0.98, 0.80, 0.62, 0.14, 0.050, 1.2},
+        };
+        gdouble diag = sqrt((gdouble)alloc.width * alloc.width +
+                            (gdouble)alloc.height * alloc.height);
+        for (gsize i = 0; i < G_N_ELEMENTS(blobs); i++) {
+            gdouble dx = 0.03 * alloc.width * sin(time_val * blobs[i].speed + blobs[i].phase);
+            gdouble dy = 0.02 * alloc.height * cos(time_val * blobs[i].speed * 0.8 + blobs[i].phase);
+            gdouble cx = blobs[i].bx * alloc.width + dx;
+            gdouble cy = blobs[i].by * alloc.height + dy;
+            gdouble rad = blobs[i].radius * diag * 0.5;
+            cairo_pattern_t *p = cairo_pattern_create_radial(cx, cy, 0.0, cx, cy, rad);
+            cairo_pattern_add_color_stop_rgba(p, 0.0, blobs[i].r, blobs[i].g, blobs[i].b, blobs[i].a);
+            cairo_pattern_add_color_stop_rgba(p, 0.55, blobs[i].r, blobs[i].g, blobs[i].b, blobs[i].a * 0.45);
+            cairo_pattern_add_color_stop_rgba(p, 1.0, blobs[i].r, blobs[i].g, blobs[i].b, 0.0);
+            cairo_set_source(cr, p);
+            cairo_paint(cr);
+            cairo_pattern_destroy(p);
+        }
+    }
     for (int i = 0; i < sf->num_stars; i++) {
         Star *s = &sf->stars[i];
         gdouble twinkle = 0.5 + 0.5 * sin(time_val * s->twinkle_speed + s->twinkle_phase);
         gdouble alpha = s->brightness * (0.4 + 0.6 * twinkle);
         gdouble px = s->x * sf->width;
         gdouble py = s->y * sf->height;
-        cairo_set_source_rgba(cr, 0.85, 0.92, 1.0, alpha);
+        if (dark)
+            cairo_set_source_rgba(cr, 0.85, 0.92, 1.0, alpha);
+        else
+            cairo_set_source_rgba(cr, 0.28, 0.36, 0.52, alpha * 0.7);
         cairo_arc(cr, px, py, s->size, 0, G_PI * 2);
         cairo_fill(cr);
+    }
+    return TRUE;
+}
+
+static gboolean starfield_is_active(GtkWidget *widget) {
+    if (!gtk_widget_get_visible(widget) || !gtk_widget_get_mapped(widget))
+        return FALSE;
+    GtkWidget *child = widget;
+    GtkWidget *parent = gtk_widget_get_parent(child);
+    while (parent) {
+        if (GTK_IS_STACK(parent) &&
+            gtk_stack_get_visible_child(GTK_STACK(parent)) != child)
+            return FALSE;
+        child = parent;
+        parent = gtk_widget_get_parent(child);
     }
     return TRUE;
 }
@@ -58,7 +113,7 @@ static gboolean on_starfield_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 static gboolean on_starfield_timeout(GtkWidget *widget) {
     StarfieldData *sf = g_object_get_data(G_OBJECT(widget), "starfield");
     if (!sf || sf->destroyed) return G_SOURCE_REMOVE;
-    if (gtk_widget_get_mapped(widget))
+    if (starfield_is_active(widget))
         gtk_widget_queue_draw(widget);
     return G_SOURCE_CONTINUE;
 }
@@ -88,7 +143,8 @@ static void on_starfield_map(GtkWidget *widget, gpointer data) {
     (void)data;
     StarfieldData *sf = g_object_get_data(G_OBJECT(widget), "starfield");
     if (sf && !sf->destroyed && sf->timer_id == 0)
-        sf->timer_id = g_timeout_add(66, (GSourceFunc)on_starfield_timeout, widget);
+        sf->timer_id = g_timeout_add(ZHI_STARFIELD_INTERVAL_MS,
+            (GSourceFunc)on_starfield_timeout, widget);
 }
 
 static void on_starfield_unmap(GtkWidget *widget, gpointer data) {
@@ -100,17 +156,16 @@ static void on_starfield_unmap(GtkWidget *widget, gpointer data) {
     }
 }
 
-static GtkWidget *create_starfield(void) {
+static GtkWidget *create_starfield(ZhiBrowser *browser) {
     GtkWidget *area = gtk_drawing_area_new();
     gtk_widget_set_hexpand(area, TRUE);
     gtk_widget_set_vexpand(area, TRUE);
     StarfieldData *sf = g_new0(StarfieldData, 1);
     sf->destroyed = FALSE;
     sf->timer_id = 0;
-    init_stars(sf, 100);
+    init_stars(sf, 60);
     g_object_set_data_full(G_OBJECT(area), "starfield", sf, starfield_data_free);
-    g_signal_connect(area, "draw", G_CALLBACK(on_starfield_draw), NULL);
-    sf->timer_id = g_timeout_add(ZHI_STARFIELD_INTERVAL_MS, (GSourceFunc)on_starfield_timeout, area);
+    g_signal_connect(area, "draw", G_CALLBACK(on_starfield_draw), browser);
     g_signal_connect(area, "map", G_CALLBACK(on_starfield_map), NULL);
     g_signal_connect(area, "unmap", G_CALLBACK(on_starfield_unmap), NULL);
     g_signal_connect(area, "destroy", G_CALLBACK(on_starfield_destroy), NULL);
@@ -136,12 +191,8 @@ static void on_newtab_search(GtkEntry *entry, gpointer user_data) {
         gchar *encoded = g_uri_escape_string(text, NULL, TRUE);
         gchar *url = g_strdup_printf("%s%s", engine, encoded);
         g_free(encoded);
-        const gchar *engine_name = "Search";
-        if (g_str_has_prefix(engine, "https://www.bing")) engine_name = "Bing";
-        else if (g_str_has_prefix(engine, "https://www.google")) engine_name = "Google";
-        else if (g_str_has_prefix(engine, "https://duckduckgo")) engine_name = "DuckDuckGo";
-        else if (g_str_has_prefix(engine, "https://search.yahoo")) engine_name = "Yahoo";
-        else if (g_str_has_prefix(engine, "https://www.baidu")) engine_name = T(browser, "百度", "Baidu");
+        const gchar *engine_name = zhi_search_engine_name(engine,
+            T(browser, "百度", "Baidu"), T(browser, "搜索", "Search"));
         zhi_browser_navigate(browser, tab, url);
         zhi_browser_update_tab_title(browser, tab, text, engine_name);
         g_free(url);
@@ -273,7 +324,7 @@ GtkWidget *zhi_new_tab_page_new(ZhiBrowser *browser) {
     gtk_widget_set_name(overlay, "newtab-page");
     gtk_widget_set_hexpand(overlay, TRUE);
     gtk_widget_set_vexpand(overlay, TRUE);
-    GtkWidget *stars = create_starfield();
+    GtkWidget *stars = create_starfield(browser);
     gtk_widget_set_hexpand(stars, TRUE);
     gtk_widget_set_vexpand(stars, TRUE);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), stars);
@@ -333,10 +384,12 @@ GtkWidget *zhi_new_tab_page_new(ZhiBrowser *browser) {
     }
     GtkWidget *search_entry = gtk_entry_new();
     gtk_widget_set_name(search_entry, "newtab-search");
-    gtk_widget_set_halign(search_entry, GTK_ALIGN_CENTER);
+    gtk_widget_set_hexpand(search_entry, TRUE);
+    gtk_widget_set_halign(search_entry, GTK_ALIGN_FILL);
+    gtk_entry_set_width_chars(GTK_ENTRY(search_entry), 20);
+    gtk_entry_set_max_width_chars(GTK_ENTRY(search_entry), 48);
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry),
         T(browser, "搜索或输入网址", "Search or enter URL"));
-    gtk_widget_set_size_request(search_entry, 600, -1);
     g_signal_connect(search_entry, "activate", G_CALLBACK(on_newtab_search), browser);
     gtk_box_pack_start(GTK_BOX(vbox), search_entry, FALSE, FALSE, 0);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), vbox);

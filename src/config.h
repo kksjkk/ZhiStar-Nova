@@ -3,14 +3,11 @@
 
 #include <gtk/gtk.h>
 
-#define ZHISTAR_CONFIG_DIR  ".config/zhistar"
 #define ZHISTAR_CONFIG_FILE "config.ini"
-#define ZHISTAR_CSS_FILE    "ui.css"
 
 typedef struct {
     GHashTable *entries;
     gchar      *config_path;
-    gchar      *css_path;
     guint       save_timeout_id;
 } ZhiConfig;
 

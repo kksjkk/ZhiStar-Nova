@@ -8,7 +8,7 @@
 #include "utils.h"
 
 #define APP_NAME "ZhiStar Nova"
-#define APP_VERSION "1.0.0-alpha"
+#define APP_VERSION "1.10"
 #define APP_CODENAME "Nova-Engine"
 
 #define ZHI_TAB_CLOSE_FADE_STEP  0.15
@@ -46,9 +46,6 @@ struct ZhiTab {
     gboolean    is_pinned;
     gboolean    custom_title;
     gboolean    navigating;
-    gulong      title_handler_id;
-    gulong      load_handler_id;
-    GList      *connected_domains;
     GList      *nav_history;
     GList      *nav_current;
 
@@ -68,7 +65,6 @@ struct ZhiBrowser {
     GtkWidget    *tab_scroll;
     GtkWidget    *add_tab_btn;
     GtkWidget    *notebook;
-    GtkWidget    *menu_btn;
     GtkWidget    *menu_popover;
     GtkWidget    *status_bar;
 
@@ -79,11 +75,6 @@ struct ZhiBrowser {
     GList        *tabs;
     ZhiTab       *active_tab;
     gint          active_tab_index;
-
-    GtkWidget    *settings_page;
-    GtkWidget    *history_page;
-    GtkWidget    *css_editor_page;
-    GtkWidget    *about_page;
 
     GList        *history;
     GList        *pinned_bookmarks;
@@ -108,6 +99,8 @@ struct ZhiBrowser {
     guint         status_clear_timer_id;
     gboolean      tab_bar_update_pending;
     gchar        *adblock_custom_css;
+    guint         session_save_timer_id;
+    gboolean      keep_session_on_exit;
 
     ZhiTab       *drag_tab;
     GtkWidget    *drag_gap;
@@ -119,7 +112,6 @@ struct ZhiBrowser {
 ZhiBrowser *zhi_browser_new(void);
 void        zhi_browser_free(ZhiBrowser *browser);
 void        zhi_browser_show(ZhiBrowser *browser);
-gchar      *sanitize_utf8(const gchar *str);
 ZhiTab     *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url);
 void        zhi_browser_close_tab(ZhiBrowser *browser, ZhiTab *tab);
 void        zhi_browser_close_tab_now(ZhiBrowser *browser, ZhiTab *tab);
@@ -131,6 +123,7 @@ void        zhi_browser_reload(ZhiBrowser *browser, ZhiTab *tab);
 void        zhi_browser_add_history(ZhiBrowser *browser, const gchar *url, const gchar *title);
 void        zhi_browser_flush_history(ZhiBrowser *browser);
 void        zhi_browser_update_status(ZhiBrowser *browser, const gchar *msg);
+void        zhi_browser_show_toast(ZhiBrowser *browser, const gchar *msg);
 void        zhi_browser_set_tab_loading(ZhiBrowser *browser, ZhiTab *tab, gboolean loading);
 void        zhi_browser_update_tab_title(ZhiBrowser *browser, ZhiTab *tab, const gchar *query, const gchar *engine_name);
 void        zhi_browser_pin_tab(ZhiBrowser *browser, ZhiTab *tab);
@@ -142,11 +135,11 @@ void        zhi_browser_save_pinned_bookmarks(ZhiBrowser *browser);
 void        zhi_browser_load_history(ZhiBrowser *browser);
 void        zhi_browser_save_history(ZhiBrowser *browser);
 void        zhi_browser_save_download_record(const gchar *uri, const gchar *filename, guint64 size);
-void        zhi_browser_start_download(ZhiBrowser *browser, const gchar *uri);
 
 GtkWidget *zhi_new_tab_page_new(ZhiBrowser *browser);
 GtkWidget *zhi_settings_page_new(ZhiBrowser *browser);
 GtkWidget *zhi_history_page_new(ZhiBrowser *browser);
+void       zhi_history_page_refresh(ZhiBrowser *browser);
 GtkWidget *zhi_downloads_page_new(ZhiBrowser *browser);
 GtkWidget *zhi_css_editor_page_new(ZhiBrowser *browser);
 GtkWidget *zhi_bookmarks_page_new(ZhiBrowser *browser);
@@ -156,6 +149,12 @@ gint      zhi_get_saved_argc(void);
 gchar    *find_resource(const gchar *filename);
 
 void zhi_browser_show_menu(ZhiBrowser *browser);
+void zhi_apply_cookie_policy(ZhiBrowser *browser);
+void zhi_apply_tracking_protection(ZhiBrowser *browser);
+void zhi_apply_ad_block(ZhiBrowser *browser, gboolean enabled);
+void zhi_apply_proxy(ZhiBrowser *browser);
+void zhi_apply_cache_model(ZhiBrowser *browser);
+void zhi_apply_do_not_track(ZhiBrowser *browser);
 void zhi_browser_reopen_closed_tab(ZhiBrowser *browser);
 void zhi_browser_zoom_in(ZhiBrowser *browser);
 void zhi_browser_zoom_out(ZhiBrowser *browser);

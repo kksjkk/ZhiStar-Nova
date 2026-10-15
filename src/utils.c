@@ -1,7 +1,5 @@
 #include "utils.h"
 #include <string.h>
-#include <stdlib.h>
-#include <time.h>
 
 gchar *sanitize_utf8(const gchar *str) {
     if (!str) return g_strdup("New Tab");
@@ -16,18 +14,18 @@ gchar *sanitize_utf8(const gchar *str) {
             p++;
         } else if ((c & 0xE0) == 0xC0 && p + 1 < end
                    && (guchar)p[1] >= 0x80 && (guchar)p[1] < 0xC0) {
-            g_string_append_printf(out, "%c%c", p[0], p[1]);
+            g_string_append_len(out, p, 2);
             p += 2;
         } else if ((c & 0xF0) == 0xE0 && p + 2 < end
                    && (guchar)p[1] >= 0x80 && (guchar)p[1] < 0xC0
                    && (guchar)p[2] >= 0x80 && (guchar)p[2] < 0xC0) {
-            g_string_append_printf(out, "%c%c%c", p[0], p[1], p[2]);
+            g_string_append_len(out, p, 3);
             p += 3;
         } else if ((c & 0xF8) == 0xF0 && p + 3 < end
                    && (guchar)p[1] >= 0x80 && (guchar)p[1] < 0xC0
                    && (guchar)p[2] >= 0x80 && (guchar)p[2] < 0xC0
                    && (guchar)p[3] >= 0x80 && (guchar)p[3] < 0xC0) {
-            g_string_append_printf(out, "%c%c%c%c", p[0], p[1], p[2], p[3]);
+            g_string_append_len(out, p, 4);
             p += 4;
         } else {
             p++;
@@ -78,12 +76,12 @@ gint zhi_search_engine_index(const gchar *url) {
 }
 
 const gchar *zhi_search_engine_name(const gchar *url, const gchar *zh, const gchar *en) {
-    (void)zh; (void)en;
-    if (!url) return "Search";
+    const gchar *fallback = en ? en : "Search";
+    if (!url) return fallback;
     if (g_str_has_prefix(url, "https://www.bing")) return "Bing";
     if (g_str_has_prefix(url, "https://www.google")) return "Google";
     if (g_str_has_prefix(url, "https://duckduckgo")) return "DuckDuckGo";
     if (g_str_has_prefix(url, "https://search.yahoo")) return "Yahoo";
     if (g_str_has_prefix(url, "https://www.baidu")) return zh ? zh : "Baidu";
-    return "Search";
+    return fallback;
 }

@@ -1,9 +1,9 @@
 #include "browser.h"
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <glib/gstdio.h>
 #include <libsoup/soup-message-headers.h>
 
 const gchar *zhi_i18n(ZhiBrowser *browser, const gchar *zh, const gchar *en) {
@@ -19,6 +19,7 @@ static void on_url_focus_in(GtkEntry *entry, GdkEventFocus *e, gpointer user_dat
 static void on_url_focus_out(GtkEntry *entry, GdkEventFocus *e, gpointer user_data);
 static void on_menu_clicked(GtkButton *btn, gpointer user_data);
 static void on_new_tab_clicked(GtkButton *btn, gpointer user_data);
+static void on_window_destroyed(GtkWidget *w, gpointer d);
 static void on_home_clicked(GtkButton *btn, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *w, GdkEvent *e, gpointer user_data);
 static void update_tab_bar(ZhiBrowser *browser);
@@ -35,6 +36,10 @@ static gboolean on_web_view_decide_policy(WebKitWebView *web_view, WebKitPolicyD
 static void on_web_view_mouse_target(WebKitWebView *web_view, WebKitHitTestResult *hit, guint modifiers, gpointer user_data);
 static void on_web_view_drag_data_received(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
     GtkSelectionData *data, guint info, guint time, gpointer user_data);
+static gboolean on_web_view_drag_drop(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
+    guint time, gpointer user_data);
+static gboolean navigate_about_url(ZhiBrowser *browser, ZhiTab *tab, const gchar *url);
+static void schedule_session_save(ZhiBrowser *browser);
 
 static void on_load_progress_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data);
 static gboolean on_history_flush_timer(gpointer user_data);
@@ -88,6 +93,38 @@ static void anim_flash(GtkWidget *w) {
     g_timeout_add(ZHI_TAB_CLOSE_ANIM_MS, anim_flash_restore, w);
 }
 
+static gboolean adhoc_menu_destroy_idle(gpointer data) {
+    GtkWidget *menu = data;
+    if (GTK_IS_WIDGET(menu)) gtk_widget_destroy(menu);
+    g_object_unref(menu);
+    return G_SOURCE_REMOVE;
+}
+
+static void adhoc_menu_schedule_destroy(GtkWidget *menu) {
+    if (!menu || !GTK_IS_WIDGET(menu)) return;
+    if (g_object_get_data(G_OBJECT(menu), "adhoc-destroy-scheduled")) return;
+    g_object_set_data(G_OBJECT(menu), "adhoc-destroy-scheduled", GINT_TO_POINTER(1));
+    g_idle_add(adhoc_menu_destroy_idle, menu);
+}
+
+static void on_adhoc_menu_deactivate(GtkMenu *menu, gpointer user_data) {
+    ZhiBrowser *browser = user_data;
+    if (browser && browser->window &&
+        g_object_get_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu") == menu)
+        g_object_set_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu", NULL);
+    adhoc_menu_schedule_destroy(GTK_WIDGET(menu));
+}
+
+static void dismiss_tab_ctx_menu(ZhiBrowser *browser) {
+    if (!browser || !browser->window) return;
+    GtkWidget *menu = g_object_get_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu");
+    if (!menu) return;
+    g_object_set_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu", NULL);
+    if (GTK_IS_WIDGET(menu) && gtk_widget_get_visible(menu))
+        gtk_menu_popdown(GTK_MENU(menu));
+    adhoc_menu_schedule_destroy(menu);
+}
+
 static void show_load_status(ZhiBrowser *browser, const gchar *fmt, const gchar *host) {
     if (!browser->status_bar) return;
     if (browser->status_hover) return;
@@ -95,6 +132,10 @@ static void show_load_status(ZhiBrowser *browser, const gchar *fmt, const gchar 
     if (!label) return;
     if (host) {
         gchar *msg = g_strdup_printf(fmt, host);
+        gtk_label_set_text(label, msg);
+        g_free(msg);
+    } else if (strstr(fmt, "%s")) {
+        gchar *msg = g_strdup_printf(fmt, "");
         gtk_label_set_text(label, msg);
         g_free(msg);
     } else {
@@ -136,6 +177,11 @@ static gchar *extract_host(const gchar *url) {
     return g_strndup(p, end - p);
 }
 
+static void strip_www_prefix(gchar *host) {
+    while (host && g_str_has_prefix(host, "www."))
+        memmove(host, host + 4, strlen(host + 4) + 1);
+}
+
 static void style_tab_button(GtkWidget *btn, gboolean active) {
     GtkStyleContext *ctx = gtk_widget_get_style_context(btn);
     gtk_style_context_remove_class(ctx, "tab");
@@ -168,7 +214,7 @@ static void on_tab_ctx_pin_tab(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *tab = g_object_get_data(G_OBJECT(item), "tab");
-    if (!tab) return;
+    if (!tab || !g_list_find(browser->tabs, tab)) return;
     if (tab->is_pinned)
         zhi_browser_unpin_tab(browser, tab);
     else
@@ -179,7 +225,7 @@ static void on_tab_ctx_pin_bookmark(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *tab = g_object_get_data(G_OBJECT(item), "tab");
-    if (!tab || !tab->url) return;
+    if (!tab || !g_list_find(browser->tabs, tab) || !tab->url) return;
     zhi_browser_add_pinned_bookmark(browser, tab->url, tab->title);
     zhi_browser_update_status(browser, T(browser, "已固定到书签栏", "Pinned to bookmarks bar"));
 }
@@ -188,23 +234,28 @@ static void on_tab_ctx_close(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *tab = g_object_get_data(G_OBJECT(item), "tab");
-    if (tab) zhi_browser_close_tab(browser, tab);
+    if (tab && g_list_find(browser->tabs, tab)) zhi_browser_close_tab(browser, tab);
 }
 
 static gboolean on_tab_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     (void)widget;
     ZhiBrowser *browser = user_data;
     if (event->type == GDK_BUTTON_PRESS && event->button == 2) {
-        if (!zhi_config_get_bool(browser->config, "close_tab_middle_click", TRUE))
-            return FALSE;
-        ZhiTab *tab = g_object_get_data(G_OBJECT(widget), "tab");
-        if (tab) zhi_browser_close_tab(browser, tab);
+        if (zhi_config_get_bool(browser->config, "close_tab_middle_click", TRUE)) {
+            ZhiTab *tab = g_object_get_data(G_OBJECT(widget), "tab");
+            if (tab) zhi_browser_close_tab(browser, tab);
+        }
         return TRUE;
     }
     if (event->type == GDK_BUTTON_PRESS && event->button == 3) {
         ZhiTab *tab = g_object_get_data(G_OBJECT(widget), "tab");
-        if (!tab) return FALSE;
+        if (!tab || tab->closing) return FALSE;
+        dismiss_tab_ctx_menu(browser);
         GtkWidget *menu = gtk_menu_new();
+        g_object_ref_sink(menu);
+        if (browser->window)
+            g_object_set_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu", menu);
+        g_signal_connect(menu, "deactivate", G_CALLBACK(on_adhoc_menu_deactivate), browser);
         const gchar *pin_label = tab->is_pinned ?
             T(browser, "取消固定标签页", "Unpin Tab") :
             T(browser, "固定标签页", "Pin Tab");
@@ -299,17 +350,15 @@ static gboolean on_tab_bar_drag_motion(GtkWidget *widget, GdkDragContext *ctx, g
     gint drop_idx = tab_bar_find_drop_index(widget, x);
 
     if (drop_idx != browser->drag_idx) {
-        if (browser->drag_gap) {
-            gtk_widget_destroy(browser->drag_gap);
-            browser->drag_gap = NULL;
-        }
         browser->drag_idx = drop_idx;
-        browser->drag_gap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        GtkStyleContext *gctx = gtk_widget_get_style_context(browser->drag_gap);
-        gtk_style_context_add_class(gctx, "tab-drag-gap");
-        gtk_widget_set_size_request(browser->drag_gap, 4, -1);
-        gtk_widget_show(browser->drag_gap);
-        gtk_box_pack_start(GTK_BOX(widget), browser->drag_gap, FALSE, FALSE, 0);
+        if (!browser->drag_gap) {
+            browser->drag_gap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+            GtkStyleContext *gctx = gtk_widget_get_style_context(browser->drag_gap);
+            gtk_style_context_add_class(gctx, "tab-drag-gap");
+            gtk_widget_set_size_request(browser->drag_gap, 4, -1);
+            gtk_widget_show(browser->drag_gap);
+            gtk_box_pack_start(GTK_BOX(widget), browser->drag_gap, FALSE, FALSE, 0);
+        }
         gtk_box_reorder_child(GTK_BOX(widget), browser->drag_gap, drop_idx);
     }
     gdk_drag_status(ctx, GDK_ACTION_MOVE, time);
@@ -334,14 +383,25 @@ static void on_tab_drag_end(GtkWidget *widget, GdkDragContext *ctx, gpointer use
     if (browser->drag_tab && browser->drag_idx >= 0) {
         gint src_idx = g_list_index(browser->tabs, browser->drag_tab);
         gint dst_idx = browser->drag_idx;
+        gint len = (gint)g_list_length(browser->tabs);
+        if (dst_idx < 0) dst_idx = 0;
+        if (dst_idx > len) dst_idx = len;
         ZhiTab *dragged = browser->drag_tab;
         if (dragged->is_pinned) {
-            GList *l = g_list_nth(browser->tabs, dst_idx);
-            if (l && l->data && !((ZhiTab *)l->data)->is_pinned) {
-                for (l = l->prev; l; l = l->prev) {
+            if (dst_idx == len) {
+                GList *l = g_list_last(browser->tabs);
+                for (; l; l = l->prev) {
                     if (((ZhiTab *)l->data)->is_pinned) { dst_idx = g_list_position(browser->tabs, l) + 1; break; }
                 }
                 if (!l) dst_idx = 0;
+            } else {
+                GList *l = g_list_nth(browser->tabs, dst_idx);
+                if (l && l->data && !((ZhiTab *)l->data)->is_pinned) {
+                    for (l = l->prev; l; l = l->prev) {
+                        if (((ZhiTab *)l->data)->is_pinned) { dst_idx = g_list_position(browser->tabs, l) + 1; break; }
+                    }
+                    if (!l) dst_idx = 0;
+                }
             }
         } else {
             GList *l = g_list_nth(browser->tabs, dst_idx);
@@ -377,7 +437,7 @@ static void on_tab_drag_end(GtkWidget *widget, GdkDragContext *ctx, gpointer use
 }
 
 static gboolean on_tab_close_btn_clicked(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
-    (void)event;
+    if (event->button != 1) return FALSE;
     ZhiBrowser *browser = user_data;
     ZhiTab *tab = g_object_get_data(G_OBJECT(widget), "tab");
     if (tab) zhi_browser_close_tab(browser, tab);
@@ -398,6 +458,7 @@ static void schedule_tab_bar_update(ZhiBrowser *browser) {
 }
 
 static void update_tab_bar(ZhiBrowser *browser) {
+    schedule_session_save(browser);
 
     GList *children = gtk_container_get_children(GTK_CONTAINER(browser->tab_bar));
     for (GList *l = children; l; l = l->next) {
@@ -453,7 +514,7 @@ static void update_tab_bar(ZhiBrowser *browser) {
             gtk_container_add(GTK_CONTAINER(close_box), close_icon);
             gtk_widget_set_size_request(close_box, 20, 20);
             g_object_set_data(G_OBJECT(close_box), "tab", tab);
-            g_signal_connect(close_box, "button-release-event", G_CALLBACK(on_tab_close_btn_clicked), browser);
+            g_signal_connect(close_box, "button-press-event", G_CALLBACK(on_tab_close_btn_clicked), browser);
             gtk_box_pack_start(GTK_BOX(outer_hbox), close_box, FALSE, FALSE, 0);
         }
 
@@ -544,7 +605,7 @@ static gboolean dl_is_download_url(const gchar *uri) {
         ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz",
         ".rar", ".7z", ".cab",
         ".iso", ".img", ".bin",
-        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
         ".mp3", ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv",
         ".wav", ".flac", ".aac", ".ogg",
         ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp",
@@ -582,21 +643,20 @@ static gboolean on_download_retry_timer(gpointer user_data) {
 
 static void on_web_view_load_changed(WebKitWebView *web_view, WebKitLoadEvent event, gpointer user_data) {
     ZhiBrowser *browser = user_data;
-    if (browser->destroying || !browser->active_tab) return;
+    if (browser->destroying) return;
     ZhiTab *tab = g_object_get_data(G_OBJECT(web_view), "zhi-tab");
-    if (!tab || tab != browser->active_tab) return;
+    if (!tab) return;
+    if (event == WEBKIT_LOAD_STARTED)
+        tab->custom_title = FALSE;
+    if (!browser->active_tab || tab != browser->active_tab) return;
     switch (event) {
     case WEBKIT_LOAD_STARTED: {
-        tab->navigating = FALSE;
-        tab->custom_title = FALSE;
         if (tab->download_retry_timer_id) {
             g_source_remove(tab->download_retry_timer_id);
             tab->download_retry_timer_id = 0;
         }
         tab->download_retry_pending = FALSE;
 
-        g_list_free_full(tab->connected_domains, g_free);
-        tab->connected_domains = NULL;
         const gchar *uri = webkit_web_view_get_uri(web_view);
         if (uri) {
             g_free(tab->url);
@@ -653,16 +713,7 @@ static void on_web_view_load_changed(WebKitWebView *web_view, WebKitLoadEvent ev
             gchar *host = extract_host(uri);
             if (host) {
                 show_load_status(browser, T(browser, "正在渲染 %s ...", "Rendering %s ..."), host);
-
-                gboolean found = FALSE;
-                for (GList *d = tab->connected_domains; d; d = d->next) {
-                    if (g_strcmp0(d->data, host) == 0) { found = TRUE; break; }
-                }
-                if (!found) {
-                    tab->connected_domains = g_list_append(tab->connected_domains, host);
-                } else {
-                    g_free(host);
-                }
+                g_free(host);
             }
         }
 
@@ -706,7 +757,9 @@ static void on_web_view_load_changed(WebKitWebView *web_view, WebKitLoadEvent ev
         break;
     }
     case WEBKIT_LOAD_FINISHED:
+        tab->navigating = FALSE;
         if (tab->loading_bar) gtk_widget_hide(tab->loading_bar);
+        zhi_browser_set_tab_loading(browser, tab, FALSE);
         if (!tab->is_home && tab->url && !g_str_has_prefix(tab->url, "about:")) {
             zhi_browser_add_history(browser, tab->url, tab->title);
         }
@@ -725,11 +778,19 @@ static void on_web_view_load_failed(WebKitWebView *web_view, GError *error, gpoi
     if (!tab || tab != browser->active_tab) return;
     const gchar *uri = webkit_web_view_get_uri(web_view);
     const gchar *failed_url = uri ? uri : "";
+    if (g_str_has_prefix(failed_url, "about:")) {
+        if (!navigate_about_url(browser, tab, failed_url))
+            gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "newtab");
+        tab->navigating = FALSE;
+        zhi_browser_set_tab_loading(browser, tab, FALSE);
+        update_nav_sensitivity(browser);
+        return;
+    }
     const gchar *err_msg = error ? error->message : "Unknown error";
     gchar *escaped_url = g_markup_escape_text(failed_url, -1);
     gchar *escaped_err = g_markup_escape_text(err_msg, -1);
     gchar *html = g_strdup_printf(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>无法访问</title>"
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>%s</title>"
         "<style>"
         "body{margin:0;padding:0;display:flex;justify-content:center;align-items:center;"
         "min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
@@ -746,22 +807,34 @@ static void on_web_view_load_failed(WebKitWebView *web_view, GError *error, gpoi
         ".retry:hover{background:#25b892;}"
         "</style></head><body><div class=\"container\">"
         "<div class=\"icon\">&#x1f310;</div>"
-        "<h1>无法访问此网站</h1>"
+        "<h1>%s</h1>"
         "<div class=\"url\">%s</div>"
         "<div class=\"hint\">"
-        "<b>&#x2022;</b> 请检查您的网络连接是否正常<br>"
-        "<b>&#x2022;</b> 请确认网址拼写是否正确<br>"
-        "<b>&#x2022;</b> 如果使用 VPN 或代理，请确认其已开启<br>"
-        "<b>&#x2022;</b> 该网站可能暂时不可用，请稍后重试"
+        "<b>&#x2022;</b> %s<br>"
+        "<b>&#x2022;</b> %s<br>"
+        "<b>&#x2022;</b> %s<br>"
+        "<b>&#x2022;</b> %s"
         "</div>"
-        "<div class=\"err\">技术详情：%s</div>"
-        "<button class=\"retry\" onclick=\"window.location.reload()\">重新加载</button>"
+        "<div class=\"err\">%s%s</div>"
+        "<button class=\"retry\" onclick=\"window.location.reload()\">%s</button>"
         "</div></body></html>",
-        escaped_url, escaped_err);
+        T(browser, "无法访问", "Cannot connect"),
+        T(browser, "无法访问此网站", "Unable to reach this website"),
+        escaped_url,
+        T(browser, "请检查您的网络连接是否正常", "Check your network connection"),
+        T(browser, "请确认网址拼写是否正确", "Check that the address is spelled correctly"),
+        T(browser, "如果使用 VPN 或代理，请确认其已开启",
+            "If you use a VPN or proxy, make sure it is enabled"),
+        T(browser, "该网站可能暂时不可用，请稍后重试",
+            "This site may be temporarily unavailable, try again later"),
+        T(browser, "技术详情：", "Technical details: "),
+        escaped_err,
+        T(browser, "重新加载", "Reload"));
     g_free(escaped_url);
     g_free(escaped_err);
     webkit_web_view_load_html(WEBKIT_WEB_VIEW(tab->web_view), html, failed_url);
     g_free(html);
+    tab->navigating = FALSE;
     zhi_browser_set_tab_loading(browser, tab, FALSE);
     update_nav_sensitivity(browser);
 }
@@ -772,7 +845,7 @@ static void on_web_view_title_changed(WebKitWebView *web_view, GParamSpec *pspec
     if (browser->destroying) return;
     ZhiTab *tab = g_object_get_data(G_OBJECT(web_view), "zhi-tab");
     if (!tab) return;
-    if (tab->custom_title) return;
+    if (tab->custom_title && webkit_web_view_is_loading(web_view)) return;
     const gchar *title = webkit_web_view_get_title(web_view);
     if (title && strlen(title) > 0) {
         g_free(tab->title);
@@ -836,7 +909,7 @@ static void on_tab_ctx_close_others(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *target = g_object_get_data(G_OBJECT(item), "tab");
-    if (!target) return;
+    if (!target || !g_list_find(browser->tabs, target)) return;
     GList *copy = g_list_copy(browser->tabs);
     for (GList *l = copy; l; l = l->next) {
         ZhiTab *t = l->data;
@@ -849,7 +922,7 @@ static void on_tab_ctx_close_left(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *target = g_object_get_data(G_OBJECT(item), "tab");
-    if (!target) return;
+    if (!target || !g_list_find(browser->tabs, target)) return;
     GList *copy = g_list_copy(browser->tabs);
     for (GList *l = copy; l; l = l->next) {
         ZhiTab *t = l->data;
@@ -863,7 +936,7 @@ static void on_tab_ctx_close_right(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     ZhiBrowser *browser = user_data;
     ZhiTab *target = g_object_get_data(G_OBJECT(item), "tab");
-    if (!target) return;
+    if (!target || !g_list_find(browser->tabs, target)) return;
     gboolean past = FALSE;
     GList *copy = g_list_copy(browser->tabs);
     for (GList *l = copy; l; l = l->next) {
@@ -955,11 +1028,16 @@ static void dl_update_buttons(ZhiDownload *dl) {
 static void dl_update_row(ZhiDownload *dl) {
     if (!dl->row_widget) return;
     gdouble pct = dl->total_size > 0 ? (gdouble)dl->received / dl->total_size : 0;
-    dl->last_update_pct = pct;
     if (dl->progress_bar) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(dl->progress_bar), pct);
 
     gchar *received_str = dl_format_size(dl->received);
     ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
+    ZhiBrowser lang_fallback;
+    if (!browser) {
+        memset(&lang_fallback, 0, sizeof(lang_fallback));
+        lang_fallback.lang = LANG_EN;
+        browser = &lang_fallback;
+    }
 
     switch (dl->state) {
     case ZHI_DL_RUNNING: {
@@ -1065,6 +1143,8 @@ static gboolean dl_poll_progress(gpointer user_data) {
     if (!dl->wk_download || !WEBKIT_IS_DOWNLOAD(dl->wk_download)) {
         dl->state = ZHI_DL_FAILED;
         dl_update_row(dl);
+        ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
+        if (browser) update_dl_button(browser);
         return G_SOURCE_REMOVE;
     }
     dl->received = webkit_download_get_received_data_length(dl->wk_download);
@@ -1078,6 +1158,7 @@ static void on_wk_download_finished(WebKitDownload *wk_dl, gpointer user_data);
 static void on_wk_download_failed(WebKitDownload *wk_dl, GError *error, gpointer user_data);
 
 static void on_dl_cancel_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiDownload *dl = user_data;
     if (!dl) return;
     if (dl->wk_download) {
@@ -1100,15 +1181,20 @@ static void on_dl_cancel_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void on_dl_copy_link_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiDownload *dl = user_data;
     if (!dl) return;
     GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(clip, dl->uri, -1);
     ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
-    if (browser) zhi_browser_update_status(browser, T(browser, "链接已复制", "Link copied"));
+    if (browser) {
+        zhi_browser_update_status(browser, T(browser, "链接已复制", "Link copied"));
+        zhi_browser_show_toast(browser, T(browser, "复制完成", "Copied"));
+    }
 }
 
 static void on_dl_open_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiDownload *dl = user_data;
     if (!dl || dl->state != ZHI_DL_FINISHED || !dl->dest_path) return;
     gchar *dir = g_path_get_dirname(dl->dest_path);
@@ -1133,6 +1219,7 @@ static void on_dl_row_destroy(GtkWidget *widget, gpointer user_data) {
 }
 
 static void on_ctx_redownload(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
     ZhiDownload *dl = user_data;
     if (!dl) return;
     ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
@@ -1151,10 +1238,12 @@ static void on_ctx_redownload(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_ctx_copy_link(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
     on_dl_copy_link_clicked(NULL, user_data);
 }
 
 static void on_ctx_delete_file(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
     ZhiDownload *dl = user_data;
     if (!dl) return;
 
@@ -1183,6 +1272,8 @@ static gboolean on_dl_row_button_press(GtkWidget *widget, GdkEventButton *event,
     }
     if (!dl) return FALSE;
     GtkWidget *menu = gtk_menu_new();
+    g_object_ref_sink(menu);
+    g_signal_connect(menu, "deactivate", G_CALLBACK(on_adhoc_menu_deactivate), NULL);
     ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
     GtkWidget *redl = gtk_menu_item_new_with_label(T(browser, "重新下载", "Redownload"));
     g_signal_connect(redl, "activate", G_CALLBACK(on_ctx_redownload), dl);
@@ -1301,7 +1392,8 @@ static void on_wk_download_finished(WebKitDownload *wk_dl, gpointer user_data) {
     dl->speed = 0;
     dl_update_row(dl);
     zhi_browser_save_download_record(dl->uri, dl->filename, dl->received);
-    if (dl->filename) {
+    GApplication *gapp = g_application_get_default();
+    if (dl->filename && gapp) {
         GNotification *n = g_notification_new(APP_NAME);
         gchar *body = g_strdup_printf("%s: %s", T(browser, "下载完成", "Download complete"), dl->filename);
         g_notification_set_body(n, body);
@@ -1309,7 +1401,7 @@ static void on_wk_download_finished(WebKitDownload *wk_dl, gpointer user_data) {
         GIcon *icon = g_themed_icon_new("download-symbolic");
         g_notification_set_icon(n, icon);
         g_object_unref(icon);
-        g_application_send_notification(g_application_get_default(), "download-complete", n);
+        g_application_send_notification(gapp, "download-complete", n);
         g_object_unref(n);
     }
     if (browser) {
@@ -1319,10 +1411,13 @@ static void on_wk_download_finished(WebKitDownload *wk_dl, gpointer user_data) {
 }
 
 static void on_wk_download_failed(WebKitDownload *wk_dl, GError *error, gpointer user_data) {
+    (void)wk_dl;
     ZhiDownload *dl = user_data;
     ZhiBrowser *browser = dl->row_widget ? g_object_get_data(G_OBJECT(dl->row_widget), "browser") : NULL;
     if (dl->poll_timer_id) { g_source_remove(dl->poll_timer_id); dl->poll_timer_id = 0; }
+    if (dl->wk_download) g_signal_handlers_disconnect_by_data(dl->wk_download, dl);
     dl->wk_download = NULL;
+    dl->progress_sig = 0;
     if (dl->user_cancelled) {
         dl->user_cancelled = FALSE;
         return;
@@ -1346,7 +1441,6 @@ static ZhiDownload *dl_add(ZhiBrowser *browser, WebKitDownload *wk_dl, const gch
     if (active >= ZHI_MAX_CONCURRENT_DOWNLOADS) {
         if (wk_dl) {
 
-            g_signal_handlers_disconnect_by_data(wk_dl, browser);
             webkit_download_cancel(wk_dl);
         }
         zhi_browser_update_status(browser, T(browser, "已达到最大并发下载数（20）", "Max concurrent downloads reached (20)"));
@@ -1357,7 +1451,9 @@ static ZhiDownload *dl_add(ZhiBrowser *browser, WebKitDownload *wk_dl, const gch
     for (GList *l = browser->downloads; l; l = l->next) {
         ZhiDownload *old = l->data;
         if (old->uri && g_strcmp0(old->uri, uri) == 0 &&
-            (old->state == ZHI_DL_RUNNING || old->state == ZHI_DL_FINISHED)) {
+            old->state == ZHI_DL_RUNNING) {
+            if (browser->active_download_count > 0)
+                browser->active_download_count--;
             if (old->wk_download) {
                 old->user_cancelled = TRUE;
                 g_signal_handlers_disconnect_by_data(old->wk_download, old);
@@ -1373,7 +1469,6 @@ static ZhiDownload *dl_add(ZhiBrowser *browser, WebKitDownload *wk_dl, const gch
     for (GList *l = to_remove; l; l = l->next) {
         ZhiDownload *old = l->data;
         browser->downloads = g_list_remove(browser->downloads, old);
-        browser->active_download_count--;
         g_free(old->uri); g_free(old->filename); g_free(old->dest_path);
         g_free(old);
     }
@@ -1566,6 +1661,7 @@ static void update_dl_button(ZhiBrowser *browser) {
 }
 
 static void on_dl_btn_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiBrowser *browser = user_data;
     if (!browser->dl_popover || !GTK_IS_WIDGET(browser->dl_popover)) return;
     if (gtk_widget_get_visible(browser->dl_popover))
@@ -1585,10 +1681,11 @@ static void on_dl_hist_btn_clicked(GtkButton *btn, gpointer user_data) {
     ZhiBrowser *browser = g_object_get_data(G_OBJECT(btn), "browser");
     if (!browser) return;
     if (browser->active_tab)
-        zhi_browser_navigate(browser, browser->active_tab, "about:zhistar:downloads");
+        zhi_browser_navigate(browser, browser->active_tab, "about:downloads");
 }
 
 static void on_dl_clear_all(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiBrowser *browser = user_data;
     GList *next = browser->downloads;
     while (next) {
@@ -1605,6 +1702,7 @@ static void on_dl_clear_all(GtkButton *btn, gpointer user_data) {
 
 static GtkWidget *dl_create_popover(ZhiBrowser *browser) {
     GtkWidget *popover = gtk_popover_new(browser->dl_btn);
+    g_object_ref_sink(popover);
     gtk_popover_set_position(GTK_POPOVER(popover), GTK_POS_BOTTOM);
     gtk_widget_set_size_request(popover, 420, 300);
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -1659,36 +1757,29 @@ static GtkWidget *dl_create_popover(ZhiBrowser *browser) {
     return popover;
 }
 
-void zhi_browser_start_download(ZhiBrowser *browser, const gchar *uri) {
-    if (!browser || !uri) return;
-    gchar *dir = dl_get_download_dir();
-    gchar *fname = dl_extract_filename(uri);
-    gchar *dest = g_build_filename(dir, fname, NULL);
-    g_free(dir); g_free(fname);
-    g_object_set_data_full(G_OBJECT(browser->window), "pending-download-uri",
-        g_strdup(uri), g_free);
-    g_object_set_data_full(G_OBJECT(browser->window), "pending-download-path",
-        dest, g_free);
-    webkit_web_context_download_uri(webkit_web_context_get_default(), uri);
-}
-
 static void on_download_started(WebKitWebContext *ctx, WebKitDownload *download, gpointer user_data) {
     (void)ctx;
     ZhiBrowser *browser = user_data;
-    gchar *uri = g_object_get_data(G_OBJECT(browser->window), "pending-download-uri");
-    gchar *path = g_object_get_data(G_OBJECT(browser->window), "pending-download-path");
-    if (path) {
-        webkit_download_set_destination(download, path);
-        g_object_set_data(G_OBJECT(browser->window), "pending-download-path", NULL);
-    }
-    const gchar *dl_uri = uri ? uri : (webkit_download_get_destination(download) ? webkit_download_get_destination(download) : "unknown");
+    GObject *src_obj = NULL;
+    WebKitWebView *src_view = webkit_download_get_web_view(download);
+    if (src_view) src_obj = G_OBJECT(src_view);
+    gchar *uri = src_obj ? g_object_get_data(src_obj, "pending-download-uri") : NULL;
+    gchar *path = src_obj ? g_object_get_data(src_obj, "pending-download-path") : NULL;
+    gpointer cl_ptr = src_obj ? g_object_get_data(src_obj, "pending-download-total-size") : NULL;
+    if (path) webkit_download_set_destination(download, path);
+    WebKitURIResponse *resp = webkit_download_get_response(download);
+    const gchar *resp_uri = resp ? webkit_uri_response_get_uri(resp) : NULL;
+    const gchar *dl_uri = uri ? uri : (resp_uri ? resp_uri : "unknown");
     ZhiDownload *dl = dl_add(browser, download, dl_uri);
+    ZhiTab *tab = src_view ? g_object_get_data(G_OBJECT(src_view), "zhi-tab") : NULL;
+    if (tab) tab->download_retry_pending = FALSE;
 
-    if (dl) {
-        gpointer cl_ptr = g_object_get_data(G_OBJECT(browser->window), "pending-download-total-size");
-        if (cl_ptr) dl->total_size = GPOINTER_TO_UINT(cl_ptr);
+    if (dl && cl_ptr) dl->total_size = (guint64)GPOINTER_TO_SIZE(cl_ptr);
+    if (src_obj) {
+        g_object_set_data(src_obj, "pending-download-uri", NULL);
+        g_object_set_data(src_obj, "pending-download-path", NULL);
+        g_object_set_data(src_obj, "pending-download-total-size", NULL);
     }
-    g_object_set_data(G_OBJECT(browser->window), "pending-download-uri", NULL);
 }
 
 ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
@@ -1713,37 +1804,15 @@ ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
     webkit_settings_set_enable_developer_extras(wk_settings, TRUE);
     webkit_settings_set_user_agent_with_application_details(wk_settings, "ZhiStarNova", APP_VERSION);
     webkit_settings_set_enable_smooth_scrolling(wk_settings, TRUE);
-    webkit_settings_set_hardware_acceleration_policy(wk_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+    const gchar *hw_policy_str = zhi_config_get(browser->config, "hardware_acceleration", "never");
+    WebKitHardwareAccelerationPolicy hw_policy = WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER;
+    if (g_strcmp0(hw_policy_str, "on_demand") == 0)
+        hw_policy = WEBKIT_HARDWARE_ACCELERATION_POLICY_ON_DEMAND;
+    else if (g_strcmp0(hw_policy_str, "always") == 0)
+        hw_policy = WEBKIT_HARDWARE_ACCELERATION_POLICY_ALWAYS;
+    webkit_settings_set_hardware_acceleration_policy(wk_settings, hw_policy);
 
     WebKitWebContext *wctx = webkit_web_context_get_default();
-
-    {
-        static gboolean cookie_initialized = FALSE;
-        if (!cookie_initialized) {
-            const gchar *cp = zhi_config_get(browser->config, "cookie_policy", "all");
-            WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(wctx);
-            if (g_strcmp0(cp, "none") == 0)
-                webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_NEVER);
-            else if (g_strcmp0(cp, "first-party") == 0)
-                webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY);
-            else
-                webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
-            cookie_initialized = TRUE;
-        }
-    }
-
-    webkit_web_context_set_cache_model(wctx, WEBKIT_CACHE_MODEL_WEB_BROWSER);
-
-    if (zhi_config_get_bool(browser->config, "proxy_enabled", FALSE)) {
-        const gchar *proxy_url = zhi_config_get(browser->config, "proxy", "");
-        if (proxy_url && strlen(proxy_url) > 0) {
-            WebKitWebsiteDataManager *dm = webkit_web_view_get_website_data_manager(WEBKIT_WEB_VIEW(tab->web_view));
-            WebKitNetworkProxySettings *ps = webkit_network_proxy_settings_new(proxy_url, NULL);
-            webkit_website_data_manager_set_network_proxy_settings(dm,
-                WEBKIT_NETWORK_PROXY_MODE_CUSTOM, ps);
-            webkit_network_proxy_settings_free(ps);
-        }
-    }
 
     WebKitSettings *wk_settings2 = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(tab->web_view));
     webkit_settings_set_allow_file_access_from_file_urls(wk_settings2, TRUE);
@@ -1755,81 +1824,14 @@ ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
         download_connected = TRUE;
     }
 
-    if (zhi_config_get_bool(browser->config, "ad_block", TRUE)) {
-        WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(tab->web_view));
-
-        static const gchar *adblock_css =
-
-            "[id*=\"google_ads\"], [id*=\"google_ad\"], [id*=\"gpt-ad\"],"
-            "[class*=\"google_ads\"], [class*=\"google-ad\"], [class*=\"adsbygoogle\"],"
-            "[id*=\"aswift\"], [id*=\"adngin\"],"
-
-            "[id*=\"ad-\"], [id*=\"ads-\"], [id*=\"ads_\"], [id*=\"_ads\"],"
-            "[id*=\"advert\"], [id*=\"banner-ad\"], [id*=\"sponsor\"],"
-            "[class*=\"ad-banner\"], [class*=\"ad-block\"], [class*=\"ad-box\"],"
-            "[class*=\"ad-container\"], [class*=\"ad-wrapper\"], [class*=\"ad-unit\"],"
-            "[class*=\"ad-slot\"], [class*=\"ad-space\"], [class*=\"ad-label\"],"
-            "[class*=\"ad-text\"], [class*=\"ad-row\"], [class*=\"ad-side\"],"
-            "[class*=\"ads-\"][class*=\"container\"], [class*=\"ads_\"][class*=\"box\"],"
-            "[class*=\"ad_container\"], [class*=\"adwrapper\"], [class*=\"adblock\"],"
-            "[class*=\"sponsored\"], [class*=\"promo\"], [class*=\"promotion\"],"
-
-            "iframe[src*=\"doubleclick\"], iframe[src*=\"googlesyndication\"],"
-            "iframe[src*=\"googleadservices\"], iframe[src*=\"adnxs\"],"
-            "iframe[src*=\"adsrvr.org\"], iframe[src*=\"taboola\"],"
-            "iframe[src*=\"outbrain\"], iframe[src*=\"zergnet\"],"
-            "iframe[src*=\"amazon-adsystem\"], iframe[src*=\"clkrevolution\"],"
-            "iframe[src*=\"serving-sys\"], iframe[src*=\"eyeblaster\"],"
-            "iframe[src*=\"adform\"], iframe[src*=\"mathtag\"],"
-            "iframe[src*=\"demdex\"], iframe[src*=\"everesttech\"],"
-
-            "[class*=\"modal-ad\"], [class*=\"popup-ad\"], [class*=\"overlay-ad\"],"
-            "[class*=\"interstitial\"], [class*=\"lightbox-ad\"],"
-            "[id*=\"overlay\"], [class*=\"overlay\"][class*=\"ad\"],"
-
-            "[class*=\"native-ad\"], [class*=\"native_ad\"],"
-            "[class*=\"advertorial\"], [class*=\"sponsored-content\"],"
-
-            ".ad, .ads, .adv, .advp, .adp, .adsbygoogle,"
-            "[data-ad-slot], [data-ad-unit], [data-ad-client],"
-            "[data-dfp-unit], [data-placeholder-ad],"
-            "ins.adsbygoogle, .adsbygoogle,"
-
-            "[class*=\"ad-module\"], [class*=\"ad-module-container\"],"
-            "[id*=\"BAIDU_SSP__wrapper\"], [id*=\"baiduad\"],"
-            "[class*=\"tb-ad\"], [class*=\"tm-promo\"],"
-
-            "iframe[width=\"0\"], iframe[height=\"0\"],"
-            "iframe[style*=\"display:none\"], iframe[style*=\"visibility:hidden\"],"
-            "iframe[style*=\"width:0\"], iframe[style*=\"height:0\"] {"
-            "display: none !important; visibility: hidden !important;"
-            "width: 0 !important; height: 0 !important;"
-            "max-height: 0 !important; overflow: hidden !important; }";
-        WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
-            adblock_css,
-            WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-            WEBKIT_USER_STYLE_LEVEL_USER,
-            NULL, NULL);
-        webkit_user_content_manager_add_style_sheet(ucm, sheet);
-        webkit_user_style_sheet_unref(sheet);
-
-        if (browser->adblock_custom_css && strlen(browser->adblock_custom_css) > 0) {
-            WebKitUserStyleSheet *custom_sheet = webkit_user_style_sheet_new(
-                browser->adblock_custom_css,
-                WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-                WEBKIT_USER_STYLE_LEVEL_USER,
-                NULL, NULL);
-            webkit_user_content_manager_add_style_sheet(ucm, custom_sheet);
-            webkit_user_style_sheet_unref(custom_sheet);
-        }
-    }
-    tab->web_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_container_add(GTK_CONTAINER(tab->web_scroll), tab->web_view);
-    gtk_stack_add_named(GTK_STACK(tab->content), tab->web_scroll, "webview");
+    gtk_widget_set_hexpand(tab->web_view, TRUE);
+    gtk_widget_set_vexpand(tab->web_view, TRUE);
+    tab->web_scroll = tab->web_view;
+    gtk_stack_add_named(GTK_STACK(tab->content), tab->web_view, "webview");
     g_object_set_data(G_OBJECT(tab->web_view), "zhi-tab", tab);
-    tab->title_handler_id = g_signal_connect(tab->web_view, "notify::title",
+    g_signal_connect(tab->web_view, "notify::title",
         G_CALLBACK(on_web_view_title_changed), browser);
-    tab->load_handler_id = g_signal_connect(tab->web_view, "load-changed",
+    g_signal_connect(tab->web_view, "load-changed",
         G_CALLBACK(on_web_view_load_changed), browser);
     g_signal_connect(tab->web_view, "notify::estimated-load-progress",
         G_CALLBACK(on_load_progress_changed), browser);
@@ -1843,8 +1845,10 @@ ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
         G_CALLBACK(on_web_view_mouse_target), browser);
     g_signal_connect(tab->web_view, "run-file-chooser",
         G_CALLBACK(on_run_file_chooser), browser);
-    gtk_drag_dest_set(tab->web_view, GTK_DEST_DEFAULT_ALL, NULL, 0, GDK_ACTION_COPY);
+    gtk_drag_dest_set(tab->web_view, GTK_DEST_DEFAULT_HIGHLIGHT, NULL, 0, GDK_ACTION_COPY);
     gtk_drag_dest_add_uri_targets(tab->web_view);
+    g_signal_connect(tab->web_view, "drag-drop",
+        G_CALLBACK(on_web_view_drag_drop), browser);
     g_signal_connect(tab->web_view, "drag-data-received",
         G_CALLBACK(on_web_view_drag_data_received), browser);
 
@@ -1887,6 +1891,8 @@ ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
     }
     browser->active_tab = tab;
     browser->active_tab_index = idx;
+    zhi_apply_ad_block(browser, zhi_config_get_bool(browser->config, "ad_block", TRUE));
+    zhi_apply_do_not_track(browser);
     if (tab->nav_box) {
         browser->dl_btn = g_object_get_data(G_OBJECT(tab->nav_box), "dl_btn");
         browser->dl_btn_drawing = browser->dl_btn;
@@ -1898,7 +1904,31 @@ ZhiTab *zhi_browser_add_tab(ZhiBrowser *browser, const gchar *url) {
     tab->nav_current = tab->nav_history;
     update_tab_bar(browser);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(browser->notebook), idx);
+    if (url && g_strcmp0(url, "about:blank") != 0 && g_strcmp0(url, "about:newtab") != 0)
+        zhi_browser_navigate(browser, tab, url);
     return tab;
+}
+
+static void detach_popovers_for_close(ZhiBrowser *browser) {
+    if (!browser) return;
+    if (browser->menu_popover) {
+        gtk_widget_destroy(browser->menu_popover);
+        browser->menu_popover = NULL;
+    }
+    if (browser->dl_popover) {
+        if (gtk_widget_get_visible(browser->dl_popover))
+            gtk_popover_popdown(GTK_POPOVER(browser->dl_popover));
+        gtk_popover_set_relative_to(GTK_POPOVER(browser->dl_popover), NULL);
+    }
+    if (browser->window) {
+        GtkWidget *ctx_menu = g_object_get_data(G_OBJECT(browser->window), "zhi-tab-ctx-menu");
+        if (ctx_menu)
+            dismiss_tab_ctx_menu(browser);
+    }
+    if (!browser->active_tab || !g_list_find(browser->tabs, browser->active_tab)) {
+        browser->dl_btn = NULL;
+        browser->dl_btn_drawing = NULL;
+    }
 }
 
 typedef struct {
@@ -1909,8 +1939,9 @@ typedef struct {
 
 static gboolean on_tab_close_fade_step(gpointer data) {
     TabCloseAnim *anim = data;
-    if (!anim || !anim->tab || !GTK_IS_WIDGET(anim->tab->page) ||
-        !g_list_find(anim->browser->tabs, anim->tab)) {
+    if (!anim || !anim->browser || anim->browser->destroying || !anim->tab ||
+        !g_list_find(anim->browser->tabs, anim->tab) || !anim->tab->closing ||
+        !GTK_IS_WIDGET(anim->tab->page)) {
         g_free(anim);
         return G_SOURCE_REMOVE;
     }
@@ -1923,14 +1954,19 @@ static gboolean on_tab_close_fade_step(gpointer data) {
 
         if (anim->tab->web_view)
             g_signal_handlers_disconnect_by_data(anim->tab->web_view, anim->browser);
+        gint page_idx = gtk_notebook_page_num(GTK_NOTEBOOK(anim->browser->notebook), anim->tab->page);
         anim->browser->tabs = g_list_remove(anim->browser->tabs, anim->tab);
-        gtk_notebook_remove_page(GTK_NOTEBOOK(anim->browser->notebook), anim->idx);
+        detach_popovers_for_close(anim->browser);
+        if (page_idx >= 0)
+            gtk_notebook_remove_page(GTK_NOTEBOOK(anim->browser->notebook), page_idx);
         g_free(anim->tab->url); g_free(anim->tab->title);
-        g_list_free_full(anim->tab->connected_domains, g_free);
         g_list_free_full(anim->tab->nav_history, g_free);
         g_free(anim->tab);
+        anim->tab = NULL;
         if (anim->browser->tabs) {
-            gint ni = MIN(anim->idx, (gint)g_list_length(anim->browser->tabs) - 1);
+            gint ni = 0;
+            if (page_idx >= 0)
+                ni = MIN(page_idx, (gint)g_list_length(anim->browser->tabs) - 1);
             zhi_browser_switch_tab(anim->browser, g_list_nth_data(anim->browser->tabs, ni));
         } else {
             anim->browser->active_tab = NULL;
@@ -1965,9 +2001,9 @@ void zhi_browser_close_tab_now(ZhiBrowser *browser, ZhiTab *tab) {
     if (tab->web_view)
         g_signal_handlers_disconnect_by_data(tab->web_view, browser);
     browser->tabs = g_list_remove(browser->tabs, tab);
+    detach_popovers_for_close(browser);
     gtk_notebook_remove_page(GTK_NOTEBOOK(browser->notebook), idx);
     g_free(tab->url); g_free(tab->title);
-    g_list_free_full(tab->connected_domains, g_free);
     g_list_free_full(tab->nav_history, g_free);
     g_free(tab);
     if (browser->tabs) {
@@ -2007,7 +2043,13 @@ void zhi_browser_set_tab_loading(ZhiBrowser *browser, ZhiTab *tab, gboolean load
     for (GList *l = children; l; l = l->next) {
         ZhiTab *t = g_object_get_data(G_OBJECT(l->data), "tab");
         if (t == tab) {
-            GtkStyleContext *ctx = gtk_widget_get_style_context(l->data);
+            GtkWidget *target = l->data;
+            GList *inner = gtk_container_get_children(GTK_CONTAINER(l->data));
+            for (GList *k = inner; k; k = k->next) {
+                if (GTK_IS_BUTTON(k->data)) { target = k->data; break; }
+            }
+            g_list_free(inner);
+            GtkStyleContext *ctx = gtk_widget_get_style_context(target);
             if (loading) gtk_style_context_add_class(ctx, "loading");
             else gtk_style_context_remove_class(ctx, "loading");
             break;
@@ -2033,6 +2075,10 @@ void zhi_browser_update_tab_title(ZhiBrowser *browser, ZhiTab *tab, const gchar 
 void zhi_browser_pin_tab(ZhiBrowser *browser, ZhiTab *tab) {
     if (!tab) return;
     tab->is_pinned = TRUE;
+    if (tab->tab_button) {
+        gtk_widget_destroy(tab->tab_button);
+        tab->tab_button = NULL;
+    }
     update_tab_bar(browser);
     zhi_browser_update_status(browser, T(browser, "标签页已固定", "Tab pinned"));
 }
@@ -2040,6 +2086,10 @@ void zhi_browser_pin_tab(ZhiBrowser *browser, ZhiTab *tab) {
 void zhi_browser_unpin_tab(ZhiBrowser *browser, ZhiTab *tab) {
     if (!tab) return;
     tab->is_pinned = FALSE;
+    if (tab->tab_button) {
+        gtk_widget_destroy(tab->tab_button);
+        tab->tab_button = NULL;
+    }
     update_tab_bar(browser);
     zhi_browser_update_status(browser, T(browser, "标签页已取消固定", "Tab unpinned"));
 }
@@ -2084,13 +2134,11 @@ void zhi_browser_save_pinned_bookmarks(ZhiBrowser *browser) {
     g_mkdir_with_parents(dir, 0700);
     gchar *path = g_build_filename(dir, "pinned_bookmarks.txt", NULL);
     g_free(dir);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        for (GList *l = browser->pinned_bookmarks; l; l = l->next) {
-            fprintf(f, "%s\n", (gchar *)l->data);
-        }
-        fclose(f);
-    }
+    GString *content = g_string_new(NULL);
+    for (GList *l = browser->pinned_bookmarks; l; l = l->next)
+        g_string_append_printf(content, "%s\n", (gchar *)l->data);
+    g_file_set_contents(path, content->str, -1, NULL);
+    g_string_free(content, TRUE);
     g_free(path);
 }
 
@@ -2159,6 +2207,7 @@ static GtkWidget *create_nav_bar(ZhiBrowser *browser, ZhiTab *tab) {
 
     GtkWidget *dl_btn = gtk_button_new_from_icon_name("download-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
     gtk_widget_set_tooltip_text(dl_btn, T(browser, "下载", "Downloads"));
+    gtk_style_context_add_class(gtk_widget_get_style_context(dl_btn), "dl-btn");
     g_signal_connect(dl_btn, "clicked", G_CALLBACK(on_dl_btn_clicked), browser);
     g_signal_connect(dl_btn, "draw", G_CALLBACK(on_dl_btn_draw), browser);
     g_object_set_data(G_OBJECT(vbox), "dl_btn", dl_btn);
@@ -2193,7 +2242,9 @@ static void on_load_progress_changed(WebKitWebView *web_view, GParamSpec *pspec,
     }
     gdouble progress = webkit_web_view_get_estimated_load_progress(web_view);
     gchar *host = extract_host(tab->url);
-    if (progress < 0.15) {
+    if (!host) {
+        show_load_status(browser, T(browser, "正在加载...", "Loading..."), NULL);
+    } else if (progress < 0.15) {
         show_load_status(browser, T(browser, "正在连接 %s ...", "Connecting to %s ..."), host);
     } else if (progress < 0.4) {
         show_load_status(browser, T(browser, "正在等待响应 %s ...", "Waiting for %s ..."), host);
@@ -2205,15 +2256,28 @@ static void on_load_progress_changed(WebKitWebView *web_view, GParamSpec *pspec,
     g_free(host);
 }
 
+static gboolean on_web_view_drag_drop(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
+    guint time, gpointer user_data) {
+    (void)x; (void)y; (void)user_data;
+    GtkTargetList *targets = gtk_target_list_new(NULL, 0);
+    gtk_target_list_add_uri_targets(targets, GDK_ACTION_COPY);
+    GdkAtom target = gtk_drag_dest_find_target(widget, ctx, targets);
+    gtk_target_list_unref(targets);
+    if (target == GDK_NONE) return FALSE;
+    gtk_drag_get_data(widget, ctx, target, time);
+    return TRUE;
+}
+
 static void on_web_view_drag_data_received(GtkWidget *widget, GdkDragContext *ctx, gint x, gint y,
     GtkSelectionData *data, guint info, guint time, gpointer user_data) {
-    (void)widget; (void)ctx; (void)info;
+    (void)widget; (void)info;
     ZhiBrowser *browser = user_data;
     if (!browser->active_tab) { gtk_drag_finish(ctx, FALSE, FALSE, time); return; }
     gchar **uris = gtk_selection_data_get_uris(data);
     if (!uris || !uris[0]) { gtk_drag_finish(ctx, FALSE, FALSE, time); g_strfreev(uris); return; }
     GString *js = g_string_new("(() => { const dt = new DataTransfer(); const addFiles = [");
     gboolean first = TRUE;
+    guint64 used_bytes = 0;
     for (gint i = 0; uris[i]; i++) {
         gchar *path = g_filename_from_uri(uris[i], NULL, NULL);
         if (!path) continue;
@@ -2222,7 +2286,15 @@ static void on_web_view_drag_data_received(GtkWidget *widget, GdkDragContext *ct
         guint64 fsize = finfo ? g_file_info_get_size(finfo) : 0;
         if (finfo) g_object_unref(finfo);
         g_object_unref(file);
-        if (fsize > 50 * 1024 * 1024) { g_free(path); continue; }
+        if (fsize > 5 * 1024 * 1024) { g_free(path); continue; }
+        if (used_bytes + fsize > 10 * 1024 * 1024) {
+            g_free(path);
+            g_string_free(js, TRUE);
+            g_strfreev(uris);
+            gtk_drag_finish(ctx, FALSE, FALSE, time);
+            return;
+        }
+        used_bytes += fsize;
         gchar *contents = NULL;
         gsize len = 0;
         if (!g_file_get_contents(path, &contents, &len, NULL)) { g_free(path); continue; }
@@ -2240,6 +2312,12 @@ static void on_web_view_drag_data_received(GtkWidget *widget, GdkDragContext *ct
     }
     g_string_append(js, "]; Promise.all(addFiles).then(f=>{f.forEach(b=>dt.items.add(b));");
     g_string_append_printf(js, "const el=document.elementFromPoint(%d,%d);if(el){el.dispatchEvent(new DragEvent('drop',{dataTransfer:dt,bubbles:true}))}})})()", x, y);
+    if (js->len > 8 * 1024 * 1024) {
+        g_string_free(js, TRUE);
+        g_strfreev(uris);
+        gtk_drag_finish(ctx, FALSE, FALSE, time);
+        return;
+    }
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(browser->active_tab->web_view),
         js->str, -1, NULL, NULL, NULL, NULL, NULL);
     g_string_free(js, TRUE);
@@ -2259,7 +2337,7 @@ static gboolean on_run_file_chooser(WebKitWebView *web_view, WebKitFileChooserRe
         T(browser, "打开", "Open"), GTK_RESPONSE_ACCEPT, NULL);
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dlg), multi);
     GtkFileFilter *f = webkit_file_chooser_request_get_mime_types_filter(request);
-    if (f) gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), g_object_ref(f));
+    if (f) gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), f);
     GtkFileFilter *all = gtk_file_filter_new();
     gtk_file_filter_set_name(all, T(browser, "所有文件", "All Files"));
     gtk_file_filter_add_pattern(all, "*");
@@ -2312,7 +2390,6 @@ static gboolean deferred_new_tab_idle(gpointer user_data) {
 
 static gboolean on_web_view_decide_policy(WebKitWebView *web_view, WebKitPolicyDecision *decision,
     WebKitPolicyDecisionType type, gpointer user_data) {
-    (void)web_view;
     ZhiBrowser *browser = user_data;
     if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
         WebKitNavigationAction *nav = webkit_navigation_policy_decision_get_navigation_action(
@@ -2323,18 +2400,20 @@ static gboolean on_web_view_decide_policy(WebKitWebView *web_view, WebKitPolicyD
             gchar *new_host = extract_host(uri);
             gchar *cur_host = (browser->active_tab && browser->active_tab->url) ?
                 extract_host(browser->active_tab->url) : NULL;
+            strip_www_prefix(new_host);
+            strip_www_prefix(cur_host);
             gboolean same_domain = FALSE;
             if (new_host && cur_host) {
-                same_domain = (g_strcmp0(new_host, cur_host) == 0);
+                same_domain = (g_ascii_strcasecmp(new_host, cur_host) == 0);
                 if (!same_domain) {
                     const gchar *np = strrchr(new_host, '.');
                     const gchar *cp = strrchr(cur_host, '.');
-                    if (np && cp && g_strcmp0(np, cp) == 0) {
+                    if (np && cp && g_ascii_strcasecmp(np, cp) == 0) {
                         gchar *np2 = g_strndup(new_host, np - new_host);
                         gchar *cp2 = g_strndup(cur_host, cp - cur_host);
                         const gchar *np3 = strrchr(np2, '.');
                         const gchar *cp3 = strrchr(cp2, '.');
-                        if (np3 && cp3 && g_strcmp0(np3, cp3) == 0)
+                        if (np3 && cp3 && g_ascii_strcasecmp(np3, cp3) == 0)
                             same_domain = TRUE;
                         g_free(np2);
                         g_free(cp2);
@@ -2396,9 +2475,9 @@ static gboolean on_web_view_decide_policy(WebKitWebView *web_view, WebKitPolicyD
             gchar *dest = g_build_filename(dir, fname, NULL);
             g_free(dir); g_free(fname);
 
-            g_object_set_data_full(G_OBJECT(browser->window), "pending-download-uri",
+            g_object_set_data_full(G_OBJECT(web_view), "pending-download-uri",
                 g_strdup(uri), g_free);
-            g_object_set_data_full(G_OBJECT(browser->window), "pending-download-path",
+            g_object_set_data_full(G_OBJECT(web_view), "pending-download-path",
                 dest, g_free);
 
             guint64 content_length = 0;
@@ -2407,8 +2486,8 @@ static gboolean on_web_view_decide_policy(WebKitWebView *web_view, WebKitPolicyD
                 const gchar *cl = soup_message_headers_get_one(headers, "Content-Length");
                 if (cl) content_length = g_ascii_strtoull(cl, NULL, 10);
             }
-            g_object_set_data(G_OBJECT(browser->window),
-                "pending-download-total-size", GUINT_TO_POINTER(content_length));
+            g_object_set_data(G_OBJECT(web_view),
+                "pending-download-total-size", GSIZE_TO_POINTER(content_length));
             webkit_policy_decision_download(decision);
             return TRUE;
         }
@@ -2425,14 +2504,16 @@ static void load_url_in_tab(ZhiBrowser *browser, ZhiTab *tab, const gchar *url) 
     else
         norm_url = g_strdup(url);
 
-    if (g_strcmp0(norm_url, "about:zhistar") == 0 || g_strcmp0(norm_url, "about:config") == 0 ||
+    if (g_strcmp0(norm_url, "about:settings") == 0 || g_strcmp0(norm_url, "about:zhistar") == 0 ||
+        g_strcmp0(norm_url, "about:config") == 0 ||
         g_strcmp0(norm_url, "about:history") == 0 || g_strcmp0(norm_url, "about:css-editor") == 0 ||
         g_strcmp0(norm_url, "about:bookmarks") == 0 || g_strcmp0(norm_url, "about:downloads") == 0) {
         ZhiTab *new_tab = zhi_browser_add_tab(browser, NULL);
         GtkWidget *page_widget = NULL;
         const gchar *stack_name = NULL;
         const gchar *tab_title = NULL;
-        if (g_strcmp0(norm_url, "about:zhistar") == 0 || g_strcmp0(norm_url, "about:config") == 0) {
+        if (g_strcmp0(norm_url, "about:settings") == 0 || g_strcmp0(norm_url, "about:zhistar") == 0 ||
+            g_strcmp0(norm_url, "about:config") == 0) {
             page_widget = zhi_settings_page_new(browser);
             stack_name = "settings";
             tab_title = T(browser, "设置", "Settings");
@@ -2462,8 +2543,11 @@ static void load_url_in_tab(ZhiBrowser *browser, ZhiTab *tab, const gchar *url) 
         new_tab->custom_title = TRUE;
         if (new_tab->url_entry) gtk_entry_set_text(GTK_ENTRY(new_tab->url_entry), "");
 
-        new_tab->nav_history = g_list_append(new_tab->nav_history, g_strdup(norm_url));
-        new_tab->nav_current = g_list_last(new_tab->nav_history);
+        g_list_free_full(new_tab->nav_history, g_free);
+        new_tab->nav_history = g_list_append(NULL, g_strdup(norm_url));
+        new_tab->nav_current = new_tab->nav_history;
+        g_free(new_tab->url);
+        new_tab->url = g_strdup(norm_url);
         update_tab_bar(browser);
         return;
     }
@@ -2482,12 +2566,14 @@ static void load_url_in_tab(ZhiBrowser *browser, ZhiTab *tab, const gchar *url) 
             gtk_entry_set_text(GTK_ENTRY(tab->url_entry), norm_url);
         gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "webview");
         tab->is_home = FALSE;
+        tab->navigating = FALSE;
         gchar *load_url = g_strdup(norm_url);
         if (!g_str_has_prefix(norm_url, "http://") && !g_str_has_prefix(norm_url, "https://") &&
             !g_str_has_prefix(norm_url, "about:") && !g_str_has_prefix(norm_url, "file://")) {
             g_free(load_url);
             load_url = g_strdup_printf("https://%s", norm_url);
         }
+        tab->download_retry_count = 0;
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(tab->web_view), load_url);
         g_free(load_url);
     }
@@ -2510,7 +2596,8 @@ static gboolean navigate_about_url(ZhiBrowser *browser, ZhiTab *tab, const gchar
         update_tab_bar(browser);
         update_nav_sensitivity(browser);
         return TRUE;
-    } else if (g_strcmp0(url, "about:zhistar") == 0 || g_strcmp0(url, "about:config") == 0) {
+    } else if (g_strcmp0(url, "about:settings") == 0 || g_strcmp0(url, "about:zhistar") == 0 ||
+               g_strcmp0(url, "about:config") == 0) {
         gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "settings");
         g_free(tab->title); tab->title = sanitize_utf8(T(browser, "设置", "Settings"));
         tab->is_home = FALSE; tab->custom_title = TRUE;
@@ -2568,6 +2655,7 @@ void zhi_browser_go_back(ZhiBrowser *browser, ZhiTab *tab) {
         gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "webview");
         tab->is_home = FALSE;
         tab->navigating = TRUE;
+        tab->download_retry_count = 0;
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(tab->web_view), url);
         update_tab_bar(browser);
         update_nav_sensitivity(browser);
@@ -2576,6 +2664,7 @@ void zhi_browser_go_back(ZhiBrowser *browser, ZhiTab *tab) {
 
     if (WEBKIT_IS_WEB_VIEW(tab->web_view) && webkit_web_view_can_go_back(WEBKIT_WEB_VIEW(tab->web_view))) {
         tab->navigating = TRUE;
+        tab->download_retry_count = 0;
         webkit_web_view_go_back(WEBKIT_WEB_VIEW(tab->web_view));
     }
 }
@@ -2593,6 +2682,7 @@ void zhi_browser_go_forward(ZhiBrowser *browser, ZhiTab *tab) {
         gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "webview");
         tab->is_home = FALSE;
         tab->navigating = TRUE;
+        tab->download_retry_count = 0;
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(tab->web_view), url);
         update_tab_bar(browser);
         update_nav_sensitivity(browser);
@@ -2601,6 +2691,7 @@ void zhi_browser_go_forward(ZhiBrowser *browser, ZhiTab *tab) {
 
     if (WEBKIT_IS_WEB_VIEW(tab->web_view) && webkit_web_view_can_go_forward(WEBKIT_WEB_VIEW(tab->web_view))) {
         tab->navigating = TRUE;
+        tab->download_retry_count = 0;
         webkit_web_view_go_forward(WEBKIT_WEB_VIEW(tab->web_view));
     }
 }
@@ -2617,6 +2708,46 @@ void zhi_browser_reload(ZhiBrowser *browser, ZhiTab *tab) {
     const gchar *visible = gtk_stack_get_visible_child_name(GTK_STACK(tab->content));
     if (visible && g_strcmp0(visible, "webview") != 0) {
         anim_flash(tab->page);
+        if (g_strcmp0(visible, "history") == 0) {
+            zhi_history_page_refresh(browser);
+            return;
+        }
+        if (g_strcmp0(visible, "settings") == 0) {
+            GtkWidget *old = gtk_stack_get_visible_child(GTK_STACK(tab->content));
+            GtkWidget *page = zhi_settings_page_new(browser);
+            if (old) gtk_container_remove(GTK_CONTAINER(tab->content), old);
+            gtk_stack_add_named(GTK_STACK(tab->content), page, "settings");
+            gtk_widget_show_all(page);
+            gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "settings");
+            return;
+        }
+        if (g_strcmp0(visible, "bookmarks") == 0) {
+            GtkWidget *old = gtk_stack_get_visible_child(GTK_STACK(tab->content));
+            GtkWidget *page = zhi_bookmarks_page_new(browser);
+            if (old) gtk_container_remove(GTK_CONTAINER(tab->content), old);
+            gtk_stack_add_named(GTK_STACK(tab->content), page, "bookmarks");
+            gtk_widget_show_all(page);
+            gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "bookmarks");
+            return;
+        }
+        if (g_strcmp0(visible, "downloads") == 0) {
+            GtkWidget *old = gtk_stack_get_visible_child(GTK_STACK(tab->content));
+            GtkWidget *page = zhi_downloads_page_new(browser);
+            if (old) gtk_container_remove(GTK_CONTAINER(tab->content), old);
+            gtk_stack_add_named(GTK_STACK(tab->content), page, "downloads");
+            gtk_widget_show_all(page);
+            gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "downloads");
+            return;
+        }
+        if (g_strcmp0(visible, "csseditor") == 0) {
+            GtkWidget *old = gtk_stack_get_visible_child(GTK_STACK(tab->content));
+            GtkWidget *page = zhi_css_editor_page_new(browser);
+            if (old) gtk_container_remove(GTK_CONTAINER(tab->content), old);
+            gtk_stack_add_named(GTK_STACK(tab->content), page, "csseditor");
+            gtk_widget_show_all(page);
+            gtk_stack_set_visible_child_name(GTK_STACK(tab->content), "csseditor");
+            return;
+        }
     }
     if (WEBKIT_IS_WEB_VIEW(tab->web_view))
         webkit_web_view_reload(WEBKIT_WEB_VIEW(tab->web_view));
@@ -2655,6 +2786,11 @@ static void on_url_activate(GtkEntry *entry, gpointer user_data) {
         g_str_has_prefix(text, "about:") || g_str_has_prefix(text, "file://")) {
         zhi_browser_navigate(browser, browser->active_tab, text);
     } else if (strchr(text, '.') && !strchr(text, ' ')) {
+        gchar *url = g_strdup_printf("https://%s", text);
+        zhi_browser_navigate(browser, browser->active_tab, url);
+        g_free(url);
+    } else if ((strchr(text, ':') || g_str_has_prefix(text, "localhost")) &&
+               !strchr(text, ' ')) {
         gchar *url = g_strdup_printf("https://%s", text);
         zhi_browser_navigate(browser, browser->active_tab, url);
         g_free(url);
@@ -2706,7 +2842,7 @@ static gboolean on_window_delete(GtkWidget *w, GdkEvent *e, gpointer user_data) 
     zhi_config_set_int(browser->config, "window_y", y);
 
     gint total_tabs = g_list_length(browser->tabs);
-    if (total_tabs > 1) {
+    if (total_tabs > 1 && zhi_config_get_bool(browser->config, "warn_on_close", FALSE)) {
         GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(browser->window),
             GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING, GTK_BUTTONS_YES_NO,
             "%s", T(browser, "确定要关闭所有标签页吗？", "Close all tabs?"));
@@ -2792,12 +2928,8 @@ static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
         return TRUE;
     }
 
-    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_F5)) {
+    if (event->keyval == GDK_KEY_F5 || ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_r)) {
         if (browser->active_tab) zhi_browser_reload(browser, browser->active_tab);
-        return TRUE;
-    }
-    if (event->keyval == GDK_KEY_F5) {
-        zhi_browser_reload(browser, browser->active_tab);
         return TRUE;
     }
 
@@ -2820,7 +2952,8 @@ static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
         return TRUE;
     }
 
-    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) && event->keyval == GDK_KEY_b) {
+    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) &&
+        gdk_keyval_to_lower(event->keyval) == GDK_KEY_b) {
         zhi_browser_navigate(browser, browser->active_tab, "about:bookmarks");
         return TRUE;
     }
@@ -2836,7 +2969,8 @@ static gboolean on_window_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
         return TRUE;
     }
 
-    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) && event->keyval == GDK_KEY_T) {
+    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) &&
+        gdk_keyval_to_lower(event->keyval) == GDK_KEY_t) {
         zhi_browser_reopen_closed_tab(browser);
         return TRUE;
     }
@@ -2902,9 +3036,9 @@ static void on_ctx_view_source(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_view_source_ready(GObject *source, GAsyncResult *result, gpointer user_data) {
-    (void)source;
     ZhiBrowser *browser = user_data;
     if (browser->destroying) return;
+    if (!WEBKIT_IS_WEB_RESOURCE(source)) return;
     GError *err = NULL;
     gsize len = 0;
     guchar *data = webkit_web_resource_get_data_finish(WEBKIT_WEB_RESOURCE(source), result, &len, &err);
@@ -2954,8 +3088,9 @@ static void on_web_view_mouse_target(WebKitWebView *web_view, WebKitHitTestResul
             browser->status_hover = TRUE;
             gtk_label_set_text(label, uri);
         }
-    } else {
+    } else if (browser->status_hover) {
         browser->status_hover = FALSE;
+        gtk_label_set_text(label, T(browser, "就绪", "Ready"));
     }
 }
 
@@ -2964,6 +3099,8 @@ static gboolean on_web_view_button_press(GtkWidget *widget, GdkEventButton *even
     ZhiBrowser *browser = user_data;
     if (event->type == GDK_BUTTON_PRESS && event->button == 3) {
         GtkWidget *menu = gtk_menu_new();
+        g_object_ref_sink(menu);
+        g_signal_connect(menu, "deactivate", G_CALLBACK(on_adhoc_menu_deactivate), NULL);
         GtkWidget *save_item = gtk_menu_item_new_with_label(
             T(browser, "另存为...", "Save As..."));
         g_signal_connect(save_item, "activate", G_CALLBACK(on_ctx_save_as), browser);
@@ -2998,18 +3135,26 @@ static void menu_btn_action(GtkButton *btn, gpointer user_data) {
     if (browser->menu_popover)
         gtk_popover_popdown(GTK_POPOVER(browser->menu_popover));
     if (g_strcmp0(action, "settings") == 0)
-        zhi_browser_navigate(browser, browser->active_tab, "about:zhistar");
+        zhi_browser_navigate(browser, browser->active_tab, "about:settings");
     else if (g_strcmp0(action, "bookmarks") == 0)
         zhi_browser_navigate(browser, browser->active_tab, "about:bookmarks");
     else if (g_strcmp0(action, "new-window") == 0) {
         gchar *exe = g_file_read_link("/proc/self/exe", NULL);
         if (exe) {
-            gchar *argv[] = {exe, NULL};
-            g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+            gchar *argv[] = {exe, "--new-instance", NULL};
+            GError *err = NULL;
+            if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err)) {
+                g_warning("spawn new window failed: %s", err ? err->message : "unknown");
+                g_clear_error(&err);
+            }
             g_free(exe);
         } else {
-            gchar *argv[] = {(gchar *)"ZhiStar-Nova", NULL};
-            g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+            gchar *argv[] = {(gchar *)"ZhiStar-Nova", "--new-instance", NULL};
+            GError *err = NULL;
+            if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err)) {
+                g_warning("spawn new window failed: %s", err ? err->message : "unknown");
+                g_clear_error(&err);
+            }
         }
     }
     else if (g_strcmp0(action, "history") == 0)
@@ -3017,7 +3162,7 @@ static void menu_btn_action(GtkButton *btn, gpointer user_data) {
     else if (g_strcmp0(action, "css-editor") == 0)
         zhi_browser_navigate(browser, browser->active_tab, "about:css-editor");
     else if (g_strcmp0(action, "about") == 0)
-        zhi_browser_navigate(browser, browser->active_tab, "about:zhistar");
+        zhi_browser_navigate(browser, browser->active_tab, "about:settings");
     else if (g_strcmp0(action, "quit") == 0)
         gtk_main_quit();
 }
@@ -3094,10 +3239,13 @@ void zhi_browser_add_history(ZhiBrowser *browser, const gchar *url, const gchar 
     gint64 now = (gint64)time(NULL);
     gchar *entry = g_strdup_printf("%" G_GINT64_FORMAT "\t%s\t%s", now, url, safe_title);
     browser->history = g_list_prepend(browser->history, entry);
-    if (g_list_length(browser->history) > ZHI_HISTORY_MAX) {
-        GList *last = g_list_last(browser->history);
+    guint count = 0;
+    GList *last = NULL;
+    for (GList *l = browser->history; l; l = l->next) { last = l; count++; }
+    if (count > ZHI_HISTORY_MAX && last) {
+        gpointer stale = last->data;
         browser->history = g_list_delete_link(browser->history, last);
-        g_free(last->data);
+        g_free(stale);
     }
     browser->history_write_buf = g_list_append(browser->history_write_buf, g_strdup(entry));
     if (!browser->history_flush_timer)
@@ -3131,6 +3279,13 @@ void zhi_browser_flush_history(ZhiBrowser *browser) {
     browser->history_flush_timer = 0;
 }
 
+static gint history_entry_compare(gconstpointer a, gconstpointer b) {
+    gint64 ta = g_ascii_strtoll((const gchar *)a, NULL, 10);
+    gint64 tb = g_ascii_strtoll((const gchar *)b, NULL, 10);
+    if (ta == tb) return 0;
+    return ta > tb ? -1 : 1;
+}
+
 void zhi_browser_load_history(ZhiBrowser *browser) {
     const gchar *home = g_get_home_dir();
     if (!home) return;
@@ -3147,6 +3302,7 @@ void zhi_browser_load_history(ZhiBrowser *browser) {
         }
         g_strfreev(lines);
         g_free(contents);
+        browser->history = g_list_sort(browser->history, history_entry_compare);
     }
     g_free(path);
 }
@@ -3158,18 +3314,19 @@ void zhi_browser_save_history(ZhiBrowser *browser) {
     g_mkdir_with_parents(dir, 0700);
     gchar *path = g_build_filename(dir, "history.txt", NULL);
     g_free(dir);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        for (GList *l = browser->history; l; l = l->next)
-            fprintf(f, "%s\n", (gchar *)l->data);
-        fclose(f);
-    }
+    GString *content = g_string_new(NULL);
+    for (GList *l = browser->history; l; l = l->next)
+        g_string_append_printf(content, "%s\n", (gchar *)l->data);
+    g_file_set_contents(path, content->str, -1, NULL);
+    g_string_free(content, TRUE);
     g_free(path);
 }
 
 static gboolean on_status_clear(gpointer user_data) {
     ZhiBrowser *browser = user_data;
-    if (browser && browser->status_bar && !browser->status_hover) {
+    if (!browser) return G_SOURCE_REMOVE;
+    browser->status_clear_timer_id = 0;
+    if (browser->status_bar && !browser->status_hover) {
         GtkLabel *label = g_object_get_data(G_OBJECT(browser->status_bar), "label");
         if (label) gtk_label_set_text(label, T(browser, "就绪", "Ready"));
     }
@@ -3187,6 +3344,58 @@ void zhi_browser_update_status(ZhiBrowser *browser, const gchar *msg) {
         if (browser->status_clear_timer_id) g_source_remove(browser->status_clear_timer_id);
         browser->status_clear_timer_id = g_timeout_add(ZHI_STATUS_CLEAR_MS, on_status_clear, browser);
     }
+}
+
+static gboolean on_toast_timeout(gpointer user_data) {
+    GtkWidget *popover = user_data;
+    gtk_widget_destroy(popover);
+    g_object_unref(popover);
+    return G_SOURCE_REMOVE;
+}
+
+void zhi_browser_show_toast(ZhiBrowser *browser, const gchar *msg) {
+    if (!browser || !browser->window || !msg) return;
+    GtkWidget *old = g_object_get_data(G_OBJECT(browser->window), "zhi-toast");
+    if (old) {
+        g_object_set_data(G_OBJECT(browser->window), "zhi-toast", NULL);
+        gtk_widget_destroy(old);
+    }
+    GtkWidget *popover = gtk_popover_new(browser->window);
+    g_object_set_data(G_OBJECT(browser->window), "zhi-toast", popover);
+    gtk_widget_set_name(popover, "zhi-toast");
+    GtkWidget *label = gtk_label_new(msg);
+    gtk_container_add(GTK_CONTAINER(popover), label);
+    gtk_popover_set_position(GTK_POPOVER(popover), GTK_POS_BOTTOM);
+    g_object_ref(popover);
+    gtk_widget_show_all(popover);
+    g_timeout_add(1500, on_toast_timeout, popover);
+}
+
+static void zhi_browser_save_session(ZhiBrowser *browser) {
+    if (!browser) return;
+    gchar *path = g_build_filename(g_get_home_dir(), ".config/zhistar", "session.txt", NULL);
+    GString *content = g_string_new(NULL);
+    for (GList *l = browser->tabs; l; l = l->next) {
+        ZhiTab *t = l->data;
+        if (!t || !t->url) continue;
+        if (dl_is_download_url(t->url)) continue;
+        g_string_append_printf(content, "%s\t%s\n", t->url, t->is_pinned ? "pinned" : "");
+    }
+    g_file_set_contents(path, content->str, -1, NULL);
+    g_string_free(content, TRUE);
+    g_free(path);
+}
+
+static gboolean on_session_save_timeout(gpointer user_data) {
+    ZhiBrowser *browser = user_data;
+    browser->session_save_timer_id = 0;
+    zhi_browser_save_session(browser);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_session_save(ZhiBrowser *browser) {
+    if (!browser || browser->destroying || browser->session_save_timer_id) return;
+    browser->session_save_timer_id = g_timeout_add(1000, on_session_save_timeout, browser);
 }
 
 static void zhi_browser_restore_session(ZhiBrowser *browser) {
@@ -3281,6 +3490,7 @@ ZhiBrowser *zhi_browser_new(void) {
     g_signal_connect(browser->window, "delete-event", G_CALLBACK(on_window_delete), browser);
     g_signal_connect(browser->window, "button-press-event", G_CALLBACK(on_window_button_press), browser);
     g_signal_connect(browser->window, "key-press-event", G_CALLBACK(on_window_key_press), browser);
+    g_signal_connect(browser->window, "destroy", G_CALLBACK(on_window_destroyed), browser);
     browser->main_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(browser->window), browser->main_vbox);
     GtkWidget *tab_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -3319,6 +3529,11 @@ ZhiBrowser *zhi_browser_new(void) {
         gtk_widget_set_visible(browser->status_bar, FALSE);
     GdkScreen *screen = gtk_window_get_screen(GTK_WINDOW(browser->window));
     zhi_theme_apply(browser->theme, screen);
+    zhi_apply_cache_model(browser);
+    zhi_apply_proxy(browser);
+    zhi_apply_cookie_policy(browser);
+    zhi_apply_tracking_protection(browser);
+    zhi_apply_do_not_track(browser);
     zhi_browser_add_tab(browser, NULL);
     zhi_browser_restore_session(browser);
     return browser;
@@ -3329,6 +3544,8 @@ void zhi_browser_free(ZhiBrowser *browser) {
     zhi_browser_flush_history(browser);
     if (browser->history_flush_timer) { g_source_remove(browser->history_flush_timer); browser->history_flush_timer = 0; }
     if (browser->status_clear_timer_id) { g_source_remove(browser->status_clear_timer_id); browser->status_clear_timer_id = 0; }
+    if (browser->dl_anim_id) { g_source_remove(browser->dl_anim_id); browser->dl_anim_id = 0; }
+    if (browser->dl_flash_timer_id) { g_source_remove(browser->dl_flash_timer_id); browser->dl_flash_timer_id = 0; }
     g_free(browser->adblock_custom_css);
     browser->destroying = TRUE;
 
@@ -3338,17 +3555,11 @@ void zhi_browser_free(ZhiBrowser *browser) {
             g_signal_handlers_disconnect_by_data(t->web_view, browser);
     }
 
-    if (zhi_config_get_bool(browser->config, "restore_session", FALSE)) {
-        gchar *path = g_build_filename(g_get_home_dir(), ".config/zhistar", "session.txt", NULL);
-        FILE *f = fopen(path, "w");
-        if (f) {
-            for (GList *l = browser->tabs; l; l = l->next) {
-                ZhiTab *t = l->data;
-                if (t && t->url) fprintf(f, "%s\t%s\n", t->url, t->is_pinned ? "pinned" : "");
-            }
-            fclose(f);
-        }
-        g_free(path);
+    if (browser->session_save_timer_id) { g_source_remove(browser->session_save_timer_id); browser->session_save_timer_id = 0; }
+    if (!browser->keep_session_on_exit) {
+        gchar *session_path = g_build_filename(g_get_home_dir(), ".config/zhistar", "session.txt", NULL);
+        g_unlink(session_path);
+        g_free(session_path);
     }
     zhi_browser_save_history(browser);
     zhi_config_save(browser->config);
@@ -3358,18 +3569,48 @@ void zhi_browser_free(ZhiBrowser *browser) {
         if (!t) continue;
         g_free(t->url);
         g_free(t->title);
-        g_list_free_full(t->connected_domains, g_free);
         g_list_free_full(t->nav_history, g_free);
         if (t->download_retry_timer_id) g_source_remove(t->download_retry_timer_id);
         g_free(t);
     }
     g_list_free(browser->tabs);
 
+    for (GList *l = browser->downloads; l; l = l->next) {
+        ZhiDownload *d = l->data;
+        if (!d) continue;
+        if (d->wk_download) {
+            g_signal_handlers_disconnect_by_data(d->wk_download, d);
+            webkit_download_cancel(d->wk_download);
+            d->wk_download = NULL;
+        }
+        if (d->poll_timer_id) { g_source_remove(d->poll_timer_id); d->poll_timer_id = 0; }
+        g_free(d->uri);
+        g_free(d->filename);
+        g_free(d->dest_path);
+    }
+    g_list_free_full(browser->downloads, g_free);
+    browser->downloads = NULL;
+
     zhi_config_free(browser->config);
     zhi_theme_free(browser->theme);
     g_list_free_full(browser->pinned_bookmarks, g_free);
     g_list_free_full(browser->history, g_free);
+    g_list_free_full(browser->closed_tabs, g_free);
+    browser->closed_tabs = NULL;
+    g_clear_object(&browser->dl_popover);
     g_free(browser);
+}
+
+static void on_window_destroyed(GtkWidget *w, gpointer d) {
+    (void)w;
+    ZhiBrowser *browser = d;
+    if (!browser) { gtk_main_quit(); return; }
+    browser->destroying = TRUE;
+    for (GList *l = browser->tabs; l; l = l->next) {
+        ZhiTab *t = l->data;
+        if (t) t->web_view = NULL;
+    }
+    gtk_main_quit();
 }
 
 void zhi_browser_show(ZhiBrowser *browser) {
@@ -3384,9 +3625,13 @@ void zhi_browser_toggle_fullscreen(ZhiBrowser *browser) {
         gtk_window_fullscreen(GTK_WINDOW(browser->window));
     else
         gtk_window_unfullscreen(GTK_WINDOW(browser->window));
-    if (browser->tab_bar) {
-        if (entering) gtk_widget_hide(browser->tab_bar);
-        else gtk_widget_show_all(browser->tab_bar);
+    if (browser->tab_scroll) {
+        if (entering) gtk_widget_hide(browser->tab_scroll);
+        else gtk_widget_show_all(browser->tab_scroll);
+    }
+    if (browser->add_tab_btn) {
+        if (entering) gtk_widget_hide(browser->add_tab_btn);
+        else gtk_widget_show_all(browser->add_tab_btn);
     }
     if (browser->status_bar) {
         if (entering) gtk_widget_hide(browser->status_bar);
@@ -3403,17 +3648,21 @@ void zhi_browser_print_page(ZhiBrowser *browser) {
     ZhiTab *tab = browser->active_tab;
     if (!tab || !WEBKIT_IS_WEB_VIEW(tab->web_view)) return;
     WebKitPrintOperation *op = webkit_print_operation_new(WEBKIT_WEB_VIEW(tab->web_view));
-    webkit_print_operation_run_dialog(op, GTK_WINDOW(browser->window));
+    if (!webkit_print_operation_run_dialog(op, GTK_WINDOW(browser->window)))
+        zhi_browser_update_status(browser, T(browser, "打印已取消或失败", "Print cancelled or failed"));
     g_object_unref(op);
 }
 
 static void on_save_page_response(GObject *source, GAsyncResult *res, gpointer user_data) {
     (void)source;
-    (void)user_data;
+    ZhiBrowser *browser = user_data;
     GError *err = NULL;
     webkit_web_view_save_to_file_finish(WEBKIT_WEB_VIEW(source), res, &err);
     if (err) {
-        g_printerr("save error: %s\n", err->message);
+        gchar *msg = g_strdup_printf("%s: %s",
+            T(browser, "保存失败", "Save failed"), err->message);
+        zhi_browser_update_status(browser, msg);
+        g_free(msg);
         g_error_free(err);
     }
 }
@@ -3505,10 +3754,12 @@ void zhi_browser_copy_page_link(ZhiBrowser *browser) {
     GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(clip, tab->url, -1);
     zhi_browser_update_status(browser, T(browser, "链接已复制", "Link copied"));
+    zhi_browser_show_toast(browser, T(browser, "复制完成", "Copied"));
 }
 
 static void on_page_info_response(GtkDialog *dialog, gint response, gpointer user_data) {
     (void)response;
+    (void)user_data;
     gtk_widget_destroy(GTK_WIDGET(dialog));
 }
 

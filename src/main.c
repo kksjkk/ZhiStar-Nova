@@ -2,7 +2,6 @@
 #include <locale.h>
 #include <signal.h>
 #include <execinfo.h>
-#include <stdlib.h>
 
 static gchar **g_saved_argv = NULL;
 static gint    g_saved_argc = 0;
@@ -23,8 +22,10 @@ int main(int argc, char *argv[]) {
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
 
-    g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
-    g_setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
+    if (g_strcmp0(g_getenv("ZHISTAR_ENABLE_ACCELERATION"), "1") != 0) {
+        g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
+        g_setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
+    }
 
     g_saved_argc = argc;
     g_saved_argv = g_new(gchar*, argc + 1);
@@ -33,7 +34,8 @@ int main(int argc, char *argv[]) {
     g_saved_argv[argc] = NULL;
 
     gtk_init(&argc, &argv);
-    webkit_web_context_set_sandbox_enabled(webkit_web_context_get_default(), FALSE);
+    gboolean sandbox_enabled = g_strcmp0(g_getenv("ZHISTAR_ENABLE_SANDBOX"), "1") == 0;
+    webkit_web_context_set_sandbox_enabled(webkit_web_context_get_default(), sandbox_enabled);
 
     ZhiConfig *init_config = zhi_config_new();
     zhi_config_load(init_config);
@@ -45,5 +47,8 @@ int main(int argc, char *argv[]) {
     gtk_main();
 
     zhi_browser_free(browser);
+    g_strfreev(g_saved_argv);
+    g_saved_argv = NULL;
+    g_saved_argc = 0;
     return 0;
 }

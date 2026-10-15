@@ -1,6 +1,19 @@
+#define _POSIX_C_SOURCE 200809L
 #include "browser.h"
 #include <string.h>
 #include <time.h>
+
+static gboolean menu_destroy_idle(gpointer data) {
+    GtkWidget *menu = data;
+    if (GTK_IS_WIDGET(menu)) gtk_widget_destroy(menu);
+    g_object_unref(menu);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_menu_deactivate(GtkMenu *menu, gpointer user_data) {
+    (void)user_data;
+    g_idle_add(menu_destroy_idle, menu);
+}
 
 static void on_history_clear_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
@@ -15,44 +28,59 @@ static void on_history_clear_clicked(GtkButton *btn, gpointer user_data) {
         g_free(path);
     }
     zhi_browser_update_status(browser, T(browser, "历史记录已清除", "History cleared"));
+    zhi_history_page_refresh(browser);
 }
 
 typedef struct {
     ZhiBrowser *browser;
     GtkWidget   *list;
-    GtkWidget   *search_entry;
     GtkWidget   *empty_label;
-    const gchar *filter;
+    gchar      *filter;
 } HistoryCtx;
+
+static void rebuild_history_list(HistoryCtx *ctx);
+
+static void history_ctx_free(gpointer data) {
+    HistoryCtx *ctx = data;
+    if (!ctx) return;
+    g_free(ctx->filter);
+    g_free(ctx);
+}
 
 static gchar *format_history_date(const gchar *timestamp_str) {
     if (!timestamp_str) return g_strdup("");
-    long ts = atol(timestamp_str);
-    struct tm *tm_info = localtime((time_t *)&ts);
+    time_t ts = (time_t)atol(timestamp_str);
+    struct tm tm_info;
     gchar *buf = g_new0(gchar, 64);
-    strftime(buf, 64, "%Y-%m-%d", tm_info);
+    if (localtime_r(&ts, &tm_info))
+        strftime(buf, 64, "%Y-%m-%d", &tm_info);
     return buf;
 }
 
 static gchar *format_history_time_short(const gchar *timestamp_str) {
     if (!timestamp_str) return g_strdup("");
-    long ts = atol(timestamp_str);
-    struct tm *tm_info = localtime((time_t *)&ts);
+    time_t ts = (time_t)atol(timestamp_str);
+    struct tm tm_info;
     gchar *buf = g_new0(gchar, 16);
-    strftime(buf, 16, "%H:%M", tm_info);
+    if (localtime_r(&ts, &tm_info))
+        strftime(buf, 16, "%H:%M", &tm_info);
     return buf;
 }
 
 static gboolean matches_filter(const gchar *entry, const gchar *filter) {
     if (!filter || strlen(filter) == 0) return TRUE;
+    if (!entry) return FALSE;
     gchar **parts = g_strsplit(entry, "\t", 3);
     gboolean match = FALSE;
-    if (parts[0]) {
-        gchar *lower_entry = g_utf8_strdown(entry, -1);
+    if (parts[1]) {
+        gchar *haystack = parts[2] ? g_strdup_printf("%s %s", parts[1], parts[2])
+                                   : g_strdup(parts[1]);
+        gchar *lower_entry = g_utf8_strdown(haystack, -1);
         gchar *lower_filter = g_utf8_strdown(filter, -1);
         match = strstr(lower_entry, lower_filter) != NULL;
         g_free(lower_entry);
         g_free(lower_filter);
+        g_free(haystack);
     }
     g_strfreev(parts);
     return match;
@@ -90,13 +118,7 @@ static void on_history_delete_clicked(GtkButton *btn, gpointer user_data) {
         g_free(path);
     }
 
-    GtkWidget *row = GTK_WIDGET(btn);
-    GtkWidget *parent = gtk_widget_get_parent(row);
-    if (parent) {
-        GtkWidget *sep = g_object_get_data(G_OBJECT(row), "separator");
-        gtk_widget_destroy(row);
-        if (sep) gtk_widget_destroy(sep);
-    }
+    rebuild_history_list(ctx);
 }
 
 static void on_history_row_clicked(GtkButton *btn, gpointer user_data) {
@@ -106,11 +128,39 @@ static void on_history_row_clicked(GtkButton *btn, gpointer user_data) {
         zhi_browser_navigate(browser, browser->active_tab, url);
 }
 
+static void on_history_copy_link(GtkMenuItem *item, gpointer user_data) {
+    ZhiBrowser *browser = user_data;
+    const gchar *url = g_object_get_data(G_OBJECT(item), "url");
+    if (!url) return;
+    GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clip, url, -1);
+    zhi_browser_show_toast(browser, T(browser, "复制完成", "Copied"));
+}
+
+static gboolean on_history_row_menu(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    if (event->type != GDK_BUTTON_PRESS || event->button != 3) return FALSE;
+    ZhiBrowser *browser = user_data;
+    const gchar *url = g_object_get_data(G_OBJECT(widget), "url");
+    if (!url || !browser) return FALSE;
+    GtkWidget *menu = gtk_menu_new();
+    g_object_ref_sink(menu);
+    g_signal_connect(menu, "deactivate", G_CALLBACK(on_menu_deactivate), NULL);
+    GtkWidget *copy = gtk_menu_item_new_with_label(T(browser, "复制链接", "Copy Link"));
+    g_object_set_data_full(G_OBJECT(copy), "url", g_strdup(url), g_free);
+    g_signal_connect(copy, "activate", G_CALLBACK(on_history_copy_link), browser);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy);
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+    return TRUE;
+}
+
 static void rebuild_history_list(HistoryCtx *ctx) {
 
     GList *children = gtk_container_get_children(GTK_CONTAINER(ctx->list));
-    for (GList *l = children; l; l = l->next)
-        gtk_widget_destroy(l->data);
+    for (GList *l = children; l; l = l->next) {
+        if (l->data != ctx->empty_label)
+            gtk_widget_destroy(l->data);
+    }
     g_list_free(children);
 
     ZhiBrowser *browser = ctx->browser;
@@ -142,6 +192,9 @@ static void rebuild_history_list(HistoryCtx *ctx) {
         g_free(date_str);
 
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_style_context_add_class(gtk_widget_get_style_context(row), "history-row");
+        g_object_set_data_full(G_OBJECT(row), "url", g_strdup(url), g_free);
+        g_signal_connect(row, "button-press-event", G_CALLBACK(on_history_row_menu), browser);
         gtk_widget_set_margin_start(row, 12);
         gtk_widget_set_margin_end(row, 12);
         gtk_widget_set_margin_top(row, 2);
@@ -198,29 +251,44 @@ static void rebuild_history_list(HistoryCtx *ctx) {
         g_strfreev(parts);
     }
     g_free(last_date);
+    gtk_widget_show_all(ctx->list);
     if (shown == 0) {
+        if (!gtk_widget_get_parent(ctx->empty_label))
+            gtk_box_pack_start(GTK_BOX(ctx->list), ctx->empty_label, TRUE, TRUE, 0);
         gtk_widget_show(ctx->empty_label);
-        gtk_box_pack_start(GTK_BOX(ctx->list), ctx->empty_label, TRUE, TRUE, 0);
     } else {
         gtk_widget_hide(ctx->empty_label);
     }
 }
 
+void zhi_history_page_refresh(ZhiBrowser *browser) {
+    if (!browser) return;
+    for (GList *l = browser->tabs; l; l = l->next) {
+        ZhiTab *tab = l->data;
+        if (!tab || !GTK_IS_STACK(tab->content)) continue;
+        GtkWidget *widget = gtk_stack_get_child_by_name(GTK_STACK(tab->content), "history");
+        if (!widget) continue;
+        HistoryCtx *ctx = g_object_get_data(G_OBJECT(widget), "history-ctx");
+        if (ctx) rebuild_history_list(ctx);
+    }
+}
+
 static void on_history_search_changed(GtkSearchEntry *entry, gpointer user_data) {
     HistoryCtx *ctx = user_data;
-    ctx->filter = gtk_entry_get_text(GTK_ENTRY(entry));
+    g_free(ctx->filter);
+    ctx->filter = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
     rebuild_history_list(ctx);
 }
 
 GtkWidget *zhi_history_page_new(ZhiBrowser *browser) {
     HistoryCtx *ctx = g_new0(HistoryCtx, 1);
     ctx->browser = browser;
-    ctx->filter = "";
+    ctx->filter = g_strdup("");
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_widget_set_name(vbox, "history-page");
     gtk_widget_set_hexpand(vbox, TRUE);
     gtk_widget_set_vexpand(vbox, TRUE);
-    g_object_set_data_full(G_OBJECT(vbox), "history-ctx", ctx, g_free);
+    g_object_set_data_full(G_OBJECT(vbox), "history-ctx", ctx, history_ctx_free);
 
     GtkWidget *title = gtk_label_new(T(browser, "历史记录", "History"));
     gtk_widget_set_halign(title, GTK_ALIGN_START);
@@ -236,13 +304,13 @@ GtkWidget *zhi_history_page_new(ZhiBrowser *browser) {
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_history_clear_clicked), browser);
     gtk_box_pack_start(GTK_BOX(vbox), clear_btn, FALSE, FALSE, 0);
 
-    ctx->search_entry = gtk_search_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(ctx->search_entry),
+    GtkWidget *search_entry = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry),
         T(browser, "搜索历史记录...", "Search history..."));
-    gtk_widget_set_margin_start(ctx->search_entry, 12);
-    gtk_widget_set_margin_end(ctx->search_entry, 12);
-    g_signal_connect(ctx->search_entry, "search-changed", G_CALLBACK(on_history_search_changed), ctx);
-    gtk_box_pack_start(GTK_BOX(vbox), ctx->search_entry, FALSE, FALSE, 0);
+    gtk_widget_set_margin_start(search_entry, 12);
+    gtk_widget_set_margin_end(search_entry, 12);
+    g_signal_connect(search_entry, "search-changed", G_CALLBACK(on_history_search_changed), ctx);
+    gtk_box_pack_start(GTK_BOX(vbox), search_entry, FALSE, FALSE, 0);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_widget_set_hexpand(scroll, TRUE);
@@ -260,7 +328,7 @@ GtkWidget *zhi_history_page_new(ZhiBrowser *browser) {
     return vbox;
 }
 
-static void on_css_save(GtkButton *btn, gpointer user_data) {
+static void on_css_apply(GtkButton *btn, gpointer user_data) {
     (void)btn;
     GtkWidget *textview = user_data;
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textview));
@@ -285,19 +353,37 @@ static void on_css_save(GtkButton *btn, gpointer user_data) {
     if (browser) {
         GdkScreen *screen = gtk_window_get_screen(GTK_WINDOW(browser->window));
         zhi_theme_apply(browser->theme, screen);
-        gchar *generated = zhi_theme_generate_css(browser->theme);
-        gtk_text_buffer_set_text(buf, generated, -1);
-        g_free(generated);
-        zhi_browser_update_status(browser, T(browser, "已恢复默认主题", "Default theme restored"));
+        if (is_empty)
+            zhi_browser_update_status(browser, T(browser, "已恢复默认主题", "Default theme restored"));
+        else
+            zhi_browser_update_status(browser, T(browser, "自定义 CSS 已应用", "Custom CSS applied"));
     }
 }
 
-static void on_css_apply(GtkButton *btn, gpointer user_data) {
+static void on_css_cancel(GtkButton *btn, gpointer user_data) {
     (void)btn;
-    ZhiBrowser *browser = user_data;
-    GdkScreen *screen = gtk_window_get_screen(GTK_WINDOW(browser->window));
-    zhi_theme_apply(browser->theme, screen);
-    zhi_browser_update_status(browser, T(browser, "自定义 CSS 已应用", "Custom CSS applied"));
+    GtkWidget *textview = user_data;
+    ZhiBrowser *browser = g_object_get_data(G_OBJECT(textview), "browser");
+    const gchar *home = g_get_home_dir();
+    gchar *path = g_build_filename(home, ".config/zhistar", "ui.css", NULL);
+    gchar *contents = NULL;
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        g_file_get_contents(path, &contents, NULL, NULL);
+        if (contents && g_strstrip(contents)[0] == '\0') {
+            g_free(contents);
+            contents = NULL;
+        }
+    }
+    g_free(path);
+    if (!contents && browser)
+        contents = zhi_theme_generate_css(browser->theme);
+    if (contents) {
+        GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textview));
+        gtk_text_buffer_set_text(buf, contents, -1);
+        g_free(contents);
+    }
+    if (browser)
+        zhi_browser_update_status(browser, T(browser, "已还原为已保存的样式", "Reverted to saved CSS"));
 }
 
 GtkWidget *zhi_css_editor_page_new(ZhiBrowser *browser) {
@@ -314,10 +400,10 @@ GtkWidget *zhi_css_editor_page_new(ZhiBrowser *browser) {
     GtkStyleContext *tctx = gtk_widget_get_style_context(title);
     gtk_style_context_add_class(tctx, "settings-title");
     gtk_box_pack_start(GTK_BOX(hbox), title, TRUE, TRUE, 0);
-    GtkWidget *save_btn = gtk_button_new_with_label(T(browser, "保存", "Save"));
-    gtk_box_pack_end(GTK_BOX(hbox), save_btn, FALSE, FALSE, 0);
     GtkWidget *apply_btn = gtk_button_new_with_label(T(browser, "应用", "Apply"));
     gtk_box_pack_end(GTK_BOX(hbox), apply_btn, FALSE, FALSE, 0);
+    GtkWidget *cancel_btn = gtk_button_new_with_label(T(browser, "取消", "Cancel"));
+    gtk_box_pack_end(GTK_BOX(hbox), cancel_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_widget_set_hexpand(scroll, TRUE);
@@ -355,8 +441,8 @@ GtkWidget *zhi_css_editor_page_new(ZhiBrowser *browser) {
     gtk_container_add(GTK_CONTAINER(scroll), textview);
     g_object_set_data(G_OBJECT(textview), "browser", browser);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_css_save), textview);
-    g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_css_apply), browser);
+    g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_css_apply), textview);
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_css_cancel), textview);
     return vbox;
 }
 
@@ -406,26 +492,36 @@ static GList *load_download_history(void) {
 typedef struct {
     ZhiBrowser *browser;
     GtkWidget   *list;
-    GtkWidget   *search_entry;
     GtkWidget   *empty_label;
-    const gchar *filter;
+    gchar       *filter;
 } DownloadsCtx;
 
+static void downloads_ctx_free(gpointer data) {
+    DownloadsCtx *ctx = data;
+    g_free(ctx->filter);
+    g_free(ctx);
+}
+
 static void on_dl_history_copy_link(GtkButton *btn, gpointer user_data) {
-    (void)user_data;
+    ZhiBrowser *browser = user_data;
     const gchar *uri = g_object_get_data(G_OBJECT(btn), "uri");
     if (!uri) return;
     GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(clip, uri, -1);
+    zhi_browser_show_toast(browser, T(browser, "复制完成", "Copied"));
 }
 
 static void do_redownload(ZhiBrowser *browser, const gchar *uri) {
     if (!uri || !browser) return;
+    if (!browser->active_tab || !browser->active_tab->web_view ||
+        !WEBKIT_IS_WEB_VIEW(browser->active_tab->web_view)) return;
 
     GList *to_remove = NULL;
     for (GList *l = browser->downloads; l; l = l->next) {
         ZhiDownload *dl = l->data;
         if (dl->uri && g_strcmp0(dl->uri, uri) == 0) {
+            if (dl->state == ZHI_DL_RUNNING && browser->active_download_count > 0)
+                browser->active_download_count--;
             if (dl->wk_download) {
                 dl->user_cancelled = TRUE;
                 g_signal_handlers_disconnect_by_data(dl->wk_download, dl);
@@ -441,7 +537,6 @@ static void do_redownload(ZhiBrowser *browser, const gchar *uri) {
     for (GList *l = to_remove; l; l = l->next) {
         ZhiDownload *dl = l->data;
         browser->downloads = g_list_remove(browser->downloads, dl);
-        browser->active_download_count--;
         g_free(dl->uri); g_free(dl->filename); g_free(dl->dest_path);
         g_free(dl);
     }
@@ -470,11 +565,12 @@ static void on_dl_history_redownload_menu(GtkMenuItem *item, gpointer user_data)
 }
 
 static void on_dl_history_copy_link_menu(GtkMenuItem *item, gpointer user_data) {
-    (void)user_data;
+    ZhiBrowser *browser = user_data;
     const gchar *uri = g_object_get_data(G_OBJECT(item), "uri");
     if (!uri) return;
     GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_clipboard_set_text(clip, uri, -1);
+    zhi_browser_show_toast(browser, T(browser, "复制完成", "Copied"));
 }
 
 static void on_dl_history_open_folder(GtkMenuItem *item, gpointer user_data) {
@@ -494,6 +590,8 @@ static void on_dl_history_row_menu(GtkWidget *widget, GdkEventButton *event, gpo
     const gchar *uri = g_object_get_data(G_OBJECT(widget), "uri");
     if (!uri || !browser) return;
     GtkWidget *menu = gtk_menu_new();
+    g_object_ref_sink(menu);
+    g_signal_connect(menu, "deactivate", G_CALLBACK(on_menu_deactivate), NULL);
     GtkWidget *redl = gtk_menu_item_new_with_label(T(browser, "重新下载", "Redownload"));
     g_object_set_data(G_OBJECT(redl), "uri", (gchar *)uri);
     g_signal_connect(redl, "activate", G_CALLBACK(on_dl_history_redownload_menu), browser);
@@ -540,8 +638,8 @@ static void on_dl_history_delete(GtkButton *btn, gpointer user_data) {
     GtkWidget *row = gtk_widget_get_parent(GTK_WIDGET(btn));
     GtkWidget *event_box = row ? gtk_widget_get_parent(row) : NULL;
     GtkWidget *sep = event_box ? g_object_get_data(G_OBJECT(event_box), "separator") : NULL;
-    if (event_box) gtk_widget_destroy(event_box);
-    if (sep) gtk_widget_destroy(sep);
+    if (GTK_IS_WIDGET(sep)) gtk_widget_destroy(sep);
+    if (GTK_IS_WIDGET(event_box)) gtk_widget_destroy(event_box);
 }
 
 static void rebuild_downloads_list(DownloadsCtx *ctx) {
@@ -568,12 +666,19 @@ static void rebuild_downloads_list(DownloadsCtx *ctx) {
             g_free(lower); g_free(lf);
             if (!match) continue;
         }
-        gchar **parts = g_strsplit(entry, "\t", 4);
+        gchar **parts = g_strsplit(entry, "\t", 3);
         if (!parts[0] || !parts[1]) { g_strfreev(parts); continue; }
         const gchar *ts_str = parts[0];
         const gchar *url = parts[1];
-        const gchar *fname = parts[2] ? parts[2] : url;
-        const gchar *size_str = parts[3] ? parts[3] : "0";
+        gchar *tail = g_strdup(parts[2] ? parts[2] : "");
+        gchar *size_dup = NULL;
+        gchar *last_tab = strrchr(tail, '\t');
+        if (last_tab) {
+            *last_tab = '\0';
+            size_dup = g_strdup(last_tab + 1);
+        }
+        const gchar *fname = tail[0] ? tail : url;
+        const gchar *size_str = size_dup ? size_dup : "0";
 
         gchar *date_str = format_history_date(ts_str);
         if (!last_date || g_strcmp0(date_str, last_date) != 0) {
@@ -600,6 +705,7 @@ static void rebuild_downloads_list(DownloadsCtx *ctx) {
         g_signal_connect(event_box, "button-press-event", G_CALLBACK(on_dl_history_row_menu), ctx->browser);
 
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_style_context_add_class(gtk_widget_get_style_context(row), "history-row");
         gtk_widget_set_margin_start(row, 8);
         gtk_widget_set_margin_end(row, 8);
         gtk_widget_set_margin_top(row, 4);
@@ -652,7 +758,7 @@ static void rebuild_downloads_list(DownloadsCtx *ctx) {
         GtkWidget *copy_btn = gtk_button_new_from_icon_name("edit-copy-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
         gtk_widget_set_tooltip_text(copy_btn, T(ctx->browser, "复制链接", "Copy Link"));
         g_object_set_data_full(G_OBJECT(copy_btn), "uri", g_strdup(uri_dup), g_free);
-        g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_dl_history_copy_link), NULL);
+        g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_dl_history_copy_link), ctx->browser);
         GtkStyleContext *ccctx = gtk_widget_get_style_context(copy_btn);
         gtk_style_context_add_class(ccctx, "history-delete-btn");
         gtk_box_pack_start(GTK_BOX(row), copy_btn, FALSE, FALSE, 0);
@@ -673,6 +779,8 @@ static void rebuild_downloads_list(DownloadsCtx *ctx) {
         gtk_widget_show_all(event_box);
         shown++;
         g_strfreev(parts);
+        g_free(tail);
+        g_free(size_dup);
     }
     g_free(last_date);
     g_list_free_full(history, g_free);
@@ -680,7 +788,8 @@ static void rebuild_downloads_list(DownloadsCtx *ctx) {
 
 static void on_dl_search_changed(GtkEditable *editable, gpointer user_data) {
     DownloadsCtx *ctx = user_data;
-    ctx->filter = gtk_entry_get_text(GTK_ENTRY(editable));
+    g_free(ctx->filter);
+    ctx->filter = g_strdup(gtk_entry_get_text(GTK_ENTRY(editable)));
     rebuild_downloads_list(ctx);
 }
 
@@ -746,10 +855,8 @@ GtkWidget *zhi_downloads_page_new(ZhiBrowser *browser) {
     DownloadsCtx *ctx = g_new0(DownloadsCtx, 1);
     ctx->browser = browser;
     ctx->list = list;
-    ctx->search_entry = search_entry;
     ctx->empty_label = empty;
-    ctx->filter = NULL;
-    g_object_set_data_full(G_OBJECT(vbox), "ctx", ctx, g_free);
+    g_object_set_data_full(G_OBJECT(vbox), "ctx", ctx, downloads_ctx_free);
 
     g_signal_connect(search_entry, "changed", G_CALLBACK(on_dl_search_changed), ctx);
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_dl_clear_all_clicked), ctx);
@@ -775,6 +882,7 @@ static void on_bm_unpin_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void on_bm_add_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
     ZhiBrowser *browser = user_data;
     ZhiTab *tab = browser->active_tab;
     if (!tab || !tab->url || !tab->title) return;
@@ -824,9 +932,11 @@ GtkWidget *zhi_bookmarks_page_new(ZhiBrowser *browser) {
     } else {
         for (GList *l = browser->pinned_bookmarks; l; l = l->next) {
             const gchar *entry = l->data;
+            if (!entry || !*entry) continue;
             gchar **parts = g_strsplit(entry, "\x1F", 2);
+            if (!parts[0] || parts[0][0] == '\0') { g_strfreev(parts); continue; }
             const gchar *url = parts[0];
-            const gchar *title_text = parts[1] ? parts[1] : url;
+            const gchar *title_text = (parts[1] && parts[1][0]) ? parts[1] : url;
 
             GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
             gtk_widget_set_margin_start(row, 12);

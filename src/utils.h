@@ -38,13 +38,11 @@ typedef struct ZhiDownload {
     gdouble         last_sample_time;
     guint64         last_sample_bytes;
     gboolean        user_cancelled;
-    gdouble         last_update_pct;
 } ZhiDownload;
 
 gchar *sanitize_utf8(const gchar *str);
 gchar *dl_format_size(guint64 bytes);
 gchar *zhi_format_eta(guint64 bytes_remaining, gdouble speed, const gchar *zh, const gchar *en);
-gchar *dl_format_size(guint64 bytes);
 gchar *dl_format_speed(gdouble bytes_per_sec);
 gint zhi_search_engine_index(const gchar *url);
 const gchar *zhi_search_engine_name(const gchar *url, const gchar *zh, const gchar *en);

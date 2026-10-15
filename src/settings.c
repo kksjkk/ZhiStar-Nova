@@ -1,11 +1,125 @@
 #include "browser.h"
-#include <string.h>
+#include <glib/gstdio.h>
 
 typedef struct {
     ZhiBrowser *browser;
     GtkWidget   *root_widget;
     GtkWidget   *notebook;
 } SettingsCtx;
+
+void zhi_apply_cookie_policy(ZhiBrowser *browser) {
+    WebKitWebContext *wctx = webkit_web_context_get_default();
+    WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(wctx);
+    if (!cm) return;
+    const gchar *policy = zhi_config_get(browser->config, "cookie_policy", "all");
+    if (g_strcmp0(policy, "none") == 0)
+        webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_NEVER);
+    else if (g_strcmp0(policy, "first-party") == 0)
+        webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY);
+    else
+        webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+}
+
+void zhi_apply_tracking_protection(ZhiBrowser *browser) {
+    WebKitWebsiteDataManager *dm = webkit_web_context_get_website_data_manager(webkit_web_context_get_default());
+    if (!dm) return;
+    const gchar *mode = zhi_config_get(browser->config, "tracking_protection", "standard");
+    const gchar *cookie = zhi_config_get(browser->config, "cookie_policy", "all");
+    gboolean itp = (g_strcmp0(mode, "custom") != 0) && (g_strcmp0(cookie, "first-party") != 0);
+    webkit_website_data_manager_set_itp_enabled(dm, itp);
+    zhi_apply_cookie_policy(browser);
+}
+
+void zhi_apply_ad_block(ZhiBrowser *browser, gboolean enabled) {
+    static const gchar *adblock_css =
+        "[id*=\"google_ads\"], [id*=\"google_ad\"], [id*=\"gpt-ad\"],"
+        "[class*=\"google_ads\"], [class*=\"google-ad\"], [class*=\"adsbygoogle\"],"
+        "[id*=\"aswift\"], [id*=\"adngin\"],"
+        "[id*=\"ad-\"], [id*=\"ads-\"], [id*=\"ads_\"], [id*=\"_ads\"],"
+        "[id*=\"advert\"], [id*=\"banner-ad\"], [id*=\"sponsor\"],"
+        "[class*=\"ad-banner\"], [class*=\"ad-block\"], [class*=\"ad-box\"],"
+        "[class*=\"ad-container\"], [class*=\"ad-wrapper\"], [class*=\"ad-unit\"],"
+        "[class*=\"ad-slot\"], [class*=\"ad-space\"], [class*=\"ad-label\"],"
+        "[class*=\"ad-text\"], [class*=\"ad-row\"], [class*=\"ad-side\"],"
+        "[class*=\"ads-\"][class*=\"container\"], [class*=\"ads_\"][class*=\"box\"],"
+        "[class*=\"ad_container\"], [class*=\"adwrapper\"], [class*=\"adblock\"],"
+        "[class*=\"sponsored\"], [class*=\"promo\"], [class*=\"promotion\"],"
+        "iframe[src*=\"doubleclick\"], iframe[src*=\"googlesyndication\"],"
+        "iframe[src*=\"googleadservices\"], iframe[src*=\"adnxs\"],"
+        "iframe[src*=\"adsrvr.org\"], iframe[src*=\"taboola\"],"
+        "iframe[src*=\"outbrain\"], iframe[src*=\"zergnet\"],"
+        "iframe[src*=\"amazon-adsystem\"], iframe[src*=\"clkrevolution\"],"
+        "iframe[src*=\"serving-sys\"], iframe[src*=\"eyeblaster\"],"
+        "iframe[src*=\"adform\"], iframe[src*=\"mathtag\"],"
+        "iframe[src*=\"demdex\"], iframe[src*=\"everesttech\"],"
+        "[class*=\"modal-ad\"], [class*=\"popup-ad\"], [class*=\"overlay-ad\"],"
+        "[class*=\"interstitial\"], [class*=\"lightbox-ad\"],"
+        "[id*=\"overlay\"], [class*=\"overlay\"][class*=\"ad\"],"
+        "[class*=\"native-ad\"], [class*=\"native_ad\"],"
+        "[class*=\"advertorial\"], [class*=\"sponsored-content\"],"
+        ".ad, .ads, .adv, .advp, .adp, .adsbygoogle,"
+        "[data-ad-slot], [data-ad-unit], [data-ad-client],"
+        "[data-dfp-unit], [data-placeholder-ad],"
+        "ins.adsbygoogle, .adsbygoogle,"
+        "[class*=\"ad-module\"], [class*=\"ad-module-container\"],"
+        "[id*=\"BAIDU_SSP__wrapper\"], [id*=\"baiduad\"],"
+        "[class*=\"tb-ad\"], [class*=\"tm-promo\"],"
+        "iframe[width=\"0\"], iframe[height=\"0\"],"
+        "iframe[style*=\"display:none\"], iframe[style*=\"visibility:hidden\"],"
+        "iframe[style*=\"width:0\"], iframe[style*=\"height:0\"] {"
+        "display: none !important; visibility: hidden !important;"
+        "width: 0 !important; height: 0 !important;"
+        "max-height: 0 !important; overflow: hidden !important; }";
+    for (GList *l = browser->tabs; l; l = l->next) {
+        ZhiTab *tab = l->data;
+        if (!tab || !tab->web_view || tab->closing) continue;
+        WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(tab->web_view));
+        if (!ucm) continue;
+        webkit_user_content_manager_remove_all_style_sheets(ucm);
+        if (!enabled) continue;
+        WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(adblock_css,
+            WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
+        webkit_user_content_manager_add_style_sheet(ucm, sheet);
+        webkit_user_style_sheet_unref(sheet);
+        if (browser->adblock_custom_css && browser->adblock_custom_css[0] != '\0') {
+            WebKitUserStyleSheet *custom_sheet = webkit_user_style_sheet_new(browser->adblock_custom_css,
+                WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
+            webkit_user_content_manager_add_style_sheet(ucm, custom_sheet);
+            webkit_user_style_sheet_unref(custom_sheet);
+        }
+    }
+}
+
+void zhi_apply_proxy(ZhiBrowser *browser) {
+    WebKitWebContext *wctx = webkit_web_context_get_default();
+    WebKitWebsiteDataManager *dm = webkit_web_context_get_website_data_manager(wctx);
+    if (!dm) return;
+    const gchar *proxy = zhi_config_get(browser->config, "proxy", "");
+    gboolean enabled = zhi_config_get_bool(browser->config, "proxy_enabled", FALSE);
+    if (enabled && proxy && proxy[0] != '\0') {
+        WebKitNetworkProxySettings *ps = webkit_network_proxy_settings_new(proxy, NULL);
+        if (ps) {
+            webkit_website_data_manager_set_network_proxy_settings(dm,
+                WEBKIT_NETWORK_PROXY_MODE_CUSTOM, ps);
+            webkit_network_proxy_settings_free(ps);
+        }
+    } else {
+        webkit_website_data_manager_set_network_proxy_settings(dm,
+            WEBKIT_NETWORK_PROXY_MODE_DEFAULT, NULL);
+    }
+}
+
+void zhi_apply_cache_model(ZhiBrowser *browser) {
+    gint mb = zhi_config_get_int(browser->config, "cache_size_mb", 500);
+    WebKitCacheModel model;
+    if (mb >= 500)
+        model = WEBKIT_CACHE_MODEL_WEB_BROWSER;
+    else if (mb >= 100)
+        model = WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER;
+    else
+        model = WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER;
+    webkit_web_context_set_cache_model(webkit_web_context_get_default(), model);
+}
 
 static void on_language_changed(GtkComboBoxText *combo, gpointer user_data) {
     SettingsCtx *ctx = user_data;
@@ -45,10 +159,11 @@ static void on_language_changed(GtkComboBoxText *combo, gpointer user_data) {
                     g_warning("Failed to restart: %s", spawn_err->message);
                     g_error_free(spawn_err);
                 }
-                for (int i = 0; i < argc; i++) g_free(new_argv[i]);
+                for (int i = 1; i < argc; i++) g_free(new_argv[i]);
                 g_free(new_argv);
                 g_free(real_path);
             }
+            ctx->browser->keep_session_on_exit = TRUE;
             gtk_main_quit();
         }
     }
@@ -87,6 +202,11 @@ static void on_session_restore_toggled(GObject *obj, GParamSpec *pspec, gpointer
     if (!ctx || !ctx->browser) return;
     zhi_config_set_bool(ctx->browser->config, "restore_session", gtk_switch_get_active(sw));
     zhi_config_save_debounced(ctx->browser->config);
+    if (!gtk_switch_get_active(sw)) {
+        gchar *path = g_build_filename(g_get_home_dir(), ".config/zhistar", "session.txt", NULL);
+        g_unlink(path);
+        g_free(path);
+    }
 }
 
 static void on_show_bookmarks_toggled(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -163,6 +283,7 @@ static void on_tracking_protection_changed(GtkComboBoxText *combo, gpointer user
     if (idx >= 0 && modes[idx]) {
         zhi_config_set(ctx->browser->config, "tracking_protection", modes[idx]);
         zhi_config_save_debounced(ctx->browser->config);
+        zhi_apply_tracking_protection(ctx->browser);
     }
 }
 
@@ -173,6 +294,27 @@ static void on_accept_cookies_changed(GtkComboBoxText *combo, gpointer user_data
     if (idx >= 0 && policies[idx]) {
         zhi_config_set(ctx->browser->config, "cookie_policy", policies[idx]);
         zhi_config_save_debounced(ctx->browser->config);
+        zhi_apply_tracking_protection(ctx->browser);
+    }
+}
+
+void zhi_apply_do_not_track(ZhiBrowser *browser) {
+    gboolean enabled = zhi_config_get_bool(browser->config, "do_not_track", TRUE);
+    static const gchar *dnt_js =
+        "try{Object.defineProperty(Navigator.prototype,'doNotTrack',"
+        "{get:function(){return '1';},configurable:true});}catch(e){}";
+    for (GList *l = browser->tabs; l; l = l->next) {
+        ZhiTab *tab = l->data;
+        if (!tab || !tab->web_view || tab->closing) continue;
+        WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(tab->web_view));
+        if (!ucm) continue;
+        webkit_user_content_manager_remove_all_scripts(ucm);
+        if (enabled) {
+            WebKitUserScript *script = webkit_user_script_new(dnt_js,
+                WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+            webkit_user_content_manager_add_script(ucm, script);
+            webkit_user_script_unref(script);
+        }
     }
 }
 
@@ -183,6 +325,7 @@ static void on_do_not_track_toggled(GObject *obj, GParamSpec *pspec, gpointer us
     if (!ctx || !ctx->browser) return;
     zhi_config_set_bool(ctx->browser->config, "do_not_track", gtk_switch_get_active(sw));
     zhi_config_save_debounced(ctx->browser->config);
+    zhi_apply_do_not_track(ctx->browser);
 }
 
 static void on_ad_block_toggled(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -192,6 +335,7 @@ static void on_ad_block_toggled(GObject *obj, GParamSpec *pspec, gpointer user_d
     if (!ctx || !ctx->browser) return;
     zhi_config_set_bool(ctx->browser->config, "ad_block", gtk_switch_get_active(sw));
     zhi_config_save_debounced(ctx->browser->config);
+    zhi_apply_ad_block(ctx->browser, gtk_switch_get_active(sw));
     zhi_browser_update_status(ctx->browser, gtk_switch_get_active(sw) ?
         T(ctx->browser, "广告拦截已开启", "Ad blocker enabled") :
         T(ctx->browser, "广告拦截已关闭", "Ad blocker disabled"));
@@ -219,6 +363,7 @@ static void on_clear_data_clicked(GtkButton *btn, gpointer user_data) {
         g_free(path);
     }
     zhi_browser_update_status(ctx->browser, T(ctx->browser, "浏览数据已清除", "Browsing data cleared"));
+    zhi_history_page_refresh(ctx->browser);
 }
 
 static void on_proxy_enabled_toggled(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -229,6 +374,7 @@ static void on_proxy_enabled_toggled(GObject *obj, GParamSpec *pspec, gpointer u
     gboolean active = gtk_switch_get_active(sw);
     zhi_config_set_bool(ctx->browser->config, "proxy_enabled", active);
     zhi_config_save_debounced(ctx->browser->config);
+    zhi_apply_proxy(ctx->browser);
     GtkWidget *proxy_entry = g_object_get_data(G_OBJECT(ctx->root_widget), "proxy-entry");
     if (proxy_entry) gtk_widget_set_visible(proxy_entry, active);
 }
@@ -238,6 +384,7 @@ static void on_proxy_changed(GtkEntry *entry, gpointer user_data) {
     const gchar *text = gtk_entry_get_text(entry);
     zhi_config_set(ctx->browser->config, "proxy", text);
     zhi_config_save_debounced(ctx->browser->config);
+    zhi_apply_proxy(ctx->browser);
 }
 
 static void on_cache_size_changed(GtkSpinButton *spin, gpointer user_data) {
@@ -245,6 +392,7 @@ static void on_cache_size_changed(GtkSpinButton *spin, gpointer user_data) {
     gint val = (gint)gtk_spin_button_get_value(spin);
     zhi_config_set_int(ctx->browser->config, "cache_size_mb", val);
     zhi_config_save_debounced(ctx->browser->config);
+    zhi_apply_cache_model(ctx->browser);
 }
 
 static void on_tab_close_middle_toggled(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -369,7 +517,7 @@ GtkWidget *zhi_settings_page_new(ZhiBrowser *browser) {
         build_row(T(browser, "主页地址", "Homepage URL"), home_entry), FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(general),
-        build_row(T(browser, "恢复上次会话", "Restore last session"),
+        build_row(T(browser, "异常退出时恢复会话", "Restore session after crash"),
             build_switch(
                 zhi_config_get_bool(browser->config, "restore_session", FALSE),
                 G_CALLBACK(on_session_restore_toggled), ctx)),
@@ -516,10 +664,13 @@ GtkWidget *zhi_settings_page_new(ZhiBrowser *browser) {
 
     gtk_box_pack_start(GTK_BOX(tabs_page), build_section(browser, "新标签页位置", "New Tab Position"), FALSE, FALSE, 0);
 
+    const gchar *ntp = zhi_config_get(browser->config, "new_tab_position", "end");
+    gint ntp_idx = (g_strcmp0(ntp, "start") == 0) ? 1 :
+                   (g_strcmp0(ntp, "after-current") == 0) ? 2 : 0;
     gtk_box_pack_start(GTK_BOX(tabs_page),
         build_row(T(browser, "新标签页打开在", "Open new tabs at"),
             build_combo((const gchar *[]){T(browser, "末尾", "End"), T(browser, "开头", "Start"), T(browser, "当前标签之后", "After current tab"), NULL},
-                0, G_CALLBACK(on_new_tab_position_changed), ctx)),
+                ntp_idx, G_CALLBACK(on_new_tab_position_changed), ctx)),
         FALSE, FALSE, 0);
 
     GtkWidget *sw_tabs = gtk_scrolled_window_new(NULL, NULL);
@@ -581,7 +732,8 @@ GtkWidget *zhi_settings_page_new(ZhiBrowser *browser) {
     gtk_style_context_add_class(atctx, "about-title");
     gtk_box_pack_start(GTK_BOX(about_center), app_title, FALSE, FALSE, 0);
 
-    gchar *ver_str = g_strdup_printf("v%s (%s)", APP_VERSION, APP_CODENAME);
+    gchar *ver_str = g_strdup_printf("v%s (%s) · WebKit %u.%u.%u", APP_VERSION, APP_CODENAME,
+        webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version());
     GtkWidget *ver_label = gtk_label_new(ver_str);
     g_free(ver_str);
     GtkStyleContext *vctx = gtk_widget_get_style_context(ver_label);
@@ -620,6 +772,8 @@ GtkWidget *zhi_settings_page_new(ZhiBrowser *browser) {
         gtk_label_new(T(browser, "  关于  ", "  About  ")));
 
     gtk_box_pack_start(GTK_BOX(vbox), ctx->notebook, TRUE, TRUE, 0);
+
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(ctx->notebook), 0);
 
     g_object_set_data_full(G_OBJECT(vbox), "settings-ctx", ctx, g_free);
 

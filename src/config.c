@@ -3,16 +3,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <glib/gstdio.h>
 
 gchar *zhi_config_get_config_dir(void) {
     const gchar *home = g_get_home_dir();
-    return g_build_filename(home, ZHISTAR_CONFIG_DIR, NULL);
+    if (home) return g_build_filename(home, ".config", "zhistar", NULL);
+    return g_build_filename(g_get_user_config_dir(), "zhistar", NULL);
 }
 
-static void ensure_dir(const gchar *path) {
-    g_mkdir_with_parents(path, 0755);
+static gboolean ensure_dir(const gchar *path) {
+    if (g_mkdir_with_parents(path, 0755) != 0) {
+        g_warning("Failed to create config directory: %s", path);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 ZhiConfig *zhi_config_new(void) {
@@ -22,7 +26,6 @@ ZhiConfig *zhi_config_new(void) {
     gchar *dir = zhi_config_get_config_dir();
     ensure_dir(dir);
     cfg->config_path = g_build_filename(dir, ZHISTAR_CONFIG_FILE, NULL);
-    cfg->css_path = g_build_filename(dir, ZHISTAR_CSS_FILE, NULL);
     g_free(dir);
     return cfg;
 }
@@ -31,12 +34,11 @@ void zhi_config_free(ZhiConfig *cfg) {
     if (!cfg) return;
     if (cfg->save_timeout_id > 0) {
         g_source_remove(cfg->save_timeout_id);
-
+        cfg->save_timeout_id = 0;
         zhi_config_save(cfg);
     }
     g_hash_table_destroy(cfg->entries);
     g_free(cfg->config_path);
-    g_free(cfg->css_path);
     g_free(cfg);
 }
 
