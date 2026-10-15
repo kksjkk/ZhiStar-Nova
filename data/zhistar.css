@@ -320,6 +320,7 @@ switch slider {
 }
 
 combobox button, spinbutton {
+    background-image: none;
     background-color: URL_BG_COLOR;
     color: FG_COLOR;
     border: 1px solid URL_BORDER_COLOR;
@@ -391,6 +392,7 @@ treeview:selected { background-color: ACCENT_COLOR; }
 label { color: FG_COLOR; }
 
 button {
+    background-image: none;
     background-color: SURFACE_COLOR;
     color: FG_COLOR;
     border: 1px solid BORDER_COLOR;
